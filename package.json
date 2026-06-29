@@ -5,11 +5,15 @@
   "dependencies": {
     "@expo/ui": "~56.0.18",
     "expo": "~56.0.12",
+    "expo-asset": "~56.0.17",
+    "expo-audio": "~56.0.12",
     "expo-constants": "~56.0.18",
+    "expo-dev-client": "~56.0.20",
     "expo-device": "~56.0.4",
     "expo-font": "~56.0.7",
     "expo-glass-effect": "~56.0.4",
     "expo-image": "~56.0.11",
+    "expo-keep-awake": "~56.0.3",
     "expo-linking": "~56.0.14",
     "expo-router": "~56.2.11",
     "expo-splash-screen": "~56.0.10",
@@ -34,9 +38,11 @@
   "scripts": {
     "start": "expo start",
     "reset-project": "node ./scripts/reset-project.js",
-    "android": "expo start --android",
-    "ios": "expo start --ios",
+    "android": "expo run:android",
+    "ios": "expo run:ios",
     "web": "expo start --web",
+    "generate:cues": "node scripts/generate-cues.js",
+    "generate:warmup": "node scripts/generate-silence-warmup.js",
     "lint": "expo lint"
   },
   "private": true

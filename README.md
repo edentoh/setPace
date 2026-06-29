@@ -1,56 +1,170 @@
-# Welcome to your Expo app 👋
+# SetPace
 
-This is an [Expo](https://expo.dev) project created with [`create-expo-app`](https://www.npmjs.com/package/create-expo-app).
+SetPace is an Expo React Native interval-start timer app for Android APK distribution.
 
-## Get started
+## Local Android APK build
 
-1. Install dependencies
+Use this flow when you want to build APKs on your own computer instead of using EAS Build. This does not use Expo Go and does not publish to the Play Store.
 
-   ```bash
-   npm install
-   ```
+### Required Software
 
-2. Start the app
+- Android Studio
+- Android SDK installed through Android Studio
+- OpenJDK / Java compatible with the Android Gradle plugin
+- Node.js and npm
 
-   ```bash
-   npx expo start
-   ```
+Make sure Android Studio can open an Android project and that your Java/Android SDK environment is available in the terminal.
 
-In the output, you'll find options to open the app in a
+On Windows, Android Studio includes a Java runtime. To make Gradle find it in the current PowerShell session:
 
-- [development build](https://docs.expo.dev/develop/development-builds/introduction/)
-- [Android emulator](https://docs.expo.dev/workflow/android-studio-emulator/)
-- [iOS simulator](https://docs.expo.dev/workflow/ios-simulator/)
-- [Expo Go](https://expo.dev/go), a limited sandbox for trying out app development with Expo
-
-You can start developing by editing the files inside the **app** directory. This project uses [file-based routing](https://docs.expo.dev/router/introduction).
-
-## Get a fresh project
-
-When you're ready, run:
-
-```bash
-npm run reset-project
+```powershell
+$env:JAVA_HOME = "$env:ProgramFiles\Android\Android Studio\jbr"
+$env:Path = "$env:JAVA_HOME\bin;$env:Path"
+java -version
 ```
 
-This command will move the starter code to the **app-example** directory and create a blank **app** directory where you can start developing.
+On Windows, Android Studio normally installs the SDK under:
 
-### Other setup steps
+```powershell
+$env:LOCALAPPDATA\Android\Sdk
+```
 
-- To set up ESLint for linting, run `npx expo lint`, or follow our guide on ["Using ESLint and Prettier"](https://docs.expo.dev/guides/using-eslint/)
-- If you'd like to set up unit testing, follow our guide on ["Unit Testing with Jest"](https://docs.expo.dev/develop/unit-testing/)
-- Learn more about the TypeScript setup in this template in our guide on ["Using TypeScript"](https://docs.expo.dev/guides/typescript/)
+If Gradle cannot find Android SDK, set `ANDROID_HOME` or `ANDROID_SDK_ROOT` to your SDK path.
 
-## Learn more
+If Gradle fails with `SDK location not found`, Android Studio is installed but the Android SDK path is missing. Open Android Studio, go to **More Actions > SDK Manager**, and install:
 
-To learn more about developing your project with Expo, look at the following resources:
+- Android SDK Platform
+- Android SDK Build-Tools
+- Android SDK Platform-Tools
+- Android SDK Command-line Tools
 
-- [Expo documentation](https://docs.expo.dev/): Learn fundamentals, or go into advanced topics with our [guides](https://docs.expo.dev/guides).
-- [Learn Expo tutorial](https://docs.expo.dev/tutorial/introduction/): Follow a step-by-step tutorial where you'll create a project that runs on Android, iOS, and the web.
+After installing, the SDK path is usually:
 
-## Join the community
+```text
+C:\Users\<you>\AppData\Local\Android\Sdk
+```
 
-Join our community of developers creating universal apps.
+Create `android/local.properties` with your real SDK path:
 
-- [Expo on GitHub](https://github.com/expo/expo): View our open source platform and contribute.
-- [Discord community](https://chat.expo.dev): Chat with Expo users and ask questions.
+```properties
+sdk.dir=C\:\\Users\\ETBZ\\AppData\\Local\\Android\\Sdk
+```
+
+`android/local.properties` is machine-local and must not be committed.
+
+### Install JavaScript Dependencies
+
+```powershell
+npm install
+```
+
+### Generate The Android Project
+
+Generate the native Android project with Expo prebuild:
+
+```powershell
+npx expo prebuild --platform android
+```
+
+This creates the `android/` folder. If `android/` already exists, inspect current native changes before regenerating or cleaning it.
+
+### Release Signing For Internal APK Testing
+
+The generated Gradle config supports local release signing through Gradle properties:
+
+- `SETPACE_RELEASE_STORE_FILE`
+- `SETPACE_RELEASE_STORE_PASSWORD`
+- `SETPACE_RELEASE_KEY_ALIAS`
+- `SETPACE_RELEASE_KEY_PASSWORD`
+
+Create a local keystore. From the project root on Windows:
+
+```powershell
+keytool -genkeypair -v -storetype JKS -keystore android/app/setpace-release.jks -alias setpace-release -keyalg RSA -keysize 2048 -validity 10000
+```
+
+If PowerShell says `keytool` is not recognized, use the Java bundled with Android Studio:
+
+```powershell
+& "$env:ProgramFiles\Android\Android Studio\jbr\bin\keytool.exe" -genkeypair -v -storetype JKS -keystore android/app/setpace-release.jks -alias setpace-release -keyalg RSA -keysize 2048 -validity 10000
+```
+
+If that path does not exist, install Android Studio or a JDK, then open a new terminal so the Java tools are available.
+
+Then add these properties to `android/gradle.properties` or your user-level `~/.gradle/gradle.properties`:
+
+```properties
+SETPACE_RELEASE_STORE_FILE=setpace-release.jks
+SETPACE_RELEASE_STORE_PASSWORD=your_store_password
+SETPACE_RELEASE_KEY_ALIAS=setpace-release
+SETPACE_RELEASE_KEY_PASSWORD=your_key_password
+```
+
+Do not commit keystore files or real passwords. Keystore patterns are listed in `.gitignore`.
+
+If these properties are missing, Gradle falls back to the generated debug keystore. That APK is installable for quick local checks, but use your local release keystore for internal distribution.
+
+### Build Release APK
+
+Windows:
+
+```powershell
+cd android
+.\gradlew.bat assembleRelease
+```
+
+macOS/Linux:
+
+```bash
+cd android
+./gradlew assembleRelease
+```
+
+If the build fails with `JvmVendorSpec IBM_SEMERU`, check that `android/gradle/wrapper/gradle-wrapper.properties` uses Gradle `8.14.3`. Gradle 9.x can be incompatible with the generated Android Gradle Plugin/React Native Gradle plugin versions.
+
+If the build fails with `Metaspace`, the local Gradle settings should use:
+
+```properties
+org.gradle.jvmargs=-Xmx4096m -XX:MaxMetaspaceSize=1536m -Dfile.encoding=UTF-8
+kotlin.daemon.jvmargs=-Xmx2048m -XX:MaxMetaspaceSize=1024m -Dfile.encoding=UTF-8
+org.gradle.workers.max=2
+org.gradle.parallel=false
+reactNativeArchitectures=arm64-v8a
+newArchEnabled=false
+```
+
+This project pins those values during prebuild. `arm64-v8a` targets modern Android phones and skips emulator/x86 native builds to reduce memory use. If you need a universal APK for old 32-bit phones or emulators, change `reactNativeArchitectures` in `android/gradle.properties` and expect longer builds.
+
+### APK Output Location
+
+The release APK is written to:
+
+```text
+android/app/build/outputs/apk/release/
+```
+
+The file is usually named:
+
+```text
+app-release.apk
+```
+
+### Install APK On Android Phone
+
+Copy the APK to your phone and open it from the file manager, or install with ADB:
+
+```powershell
+adb install android/app/build/outputs/apk/release/app-release.apk
+```
+
+If you already have SetPace installed with a different signing key, uninstall the old app first or Android will reject the update.
+
+### Faster Development Without Full APK Rebuilds
+
+For JavaScript and TypeScript changes, use a development build so you do not need a release APK for every edit:
+
+```powershell
+npx expo start --dev-client
+```
+
+Build a local release APK again when you need to test the standalone installed app.

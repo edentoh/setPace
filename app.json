@@ -1,6 +1,6 @@
 {
   "expo": {
-    "name": "setpace",
+    "name": "SetPace",
     "slug": "setpace",
     "version": "1.0.0",
     "orientation": "portrait",
@@ -8,16 +8,19 @@
     "scheme": "setpace",
     "userInterfaceStyle": "automatic",
     "ios": {
-      "icon": "./assets/expo.icon"
+      "icon": "./assets/images/icon.png"
     },
     "android": {
+      "icon": "./assets/images/icon.png",
       "adaptiveIcon": {
-        "backgroundColor": "#E6F4FE",
-        "foregroundImage": "./assets/images/android-icon-foreground.png",
-        "backgroundImage": "./assets/images/android-icon-background.png",
-        "monochromeImage": "./assets/images/android-icon-monochrome.png"
+        "backgroundColor": "#07100f",
+        "foregroundImage": "./assets/images/icon.png",
+        "monochromeImage": "./assets/images/icon.png"
       },
-      "predictiveBackGestureEnabled": false
+      "predictiveBackGestureEnabled": false,
+      "softwareKeyboardLayoutMode": "resize",
+      "package": "com.edent.setpace",
+      "versionCode": 1
     },
     "web": {
       "output": "static",
@@ -34,11 +37,25 @@
             "imageWidth": 76
           }
         }
-      ]
+      ],
+      [
+        "expo-audio",
+        {
+          "recordAudioAndroid": false,
+          "enableBackgroundPlayback": false
+        }
+      ],
+      "./plugins/with-local-android-signing"
     ],
     "experiments": {
       "typedRoutes": true,
       "reactCompiler": true
+    },
+    "extra": {
+      "router": {},
+      "eas": {
+        "projectId": "c3202e54-d422-4362-8c81-5510898d970b"
+      }
     }
   }
 }

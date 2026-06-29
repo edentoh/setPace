@@ -1,22 +1,6 @@
 import { useKeepAwake } from 'expo-keep-awake';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
-  cueAudioLog,
-  ensureAudioReady,
-  getCueAudioState,
-  invalidateCueAudio,
-  isCueAudioReady,
-  playCompleteCue,
-  playCountdownCue,
-  playMarkCue,
-  playStartCue,
-  primeStartCueAfterInteraction,
-  recreateCuePlayersForRun,
-  setCueAudioRunSequence,
-  stopAllCues,
-} from '@/lib/cueAudio';
-
-import {
   AppState,
   KeyboardAvoidingView,
   Platform,
@@ -31,19 +15,32 @@ import {
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 
-type TimerStatus = 'idle' | 'readying' | 'running' | 'paused' | 'complete';
-type LoopCueMode = 'countdown' | 'mark';
+import {
+  cueAudioLog,
+  getCueAudioState,
+  invalidateCueAudio,
+  isCueAudioReady,
+  playCompleteCue,
+  playCountdownCue,
+  playMarkCue,
+  playReminderCue,
+  playStartCue,
+  prepareAudioBestEffort,
+  setCueAudioRunSequence,
+  stopAllCues,
+} from '@/lib/cueAudio';
+import {
+  createCueSchedule,
+  getDueCueEvents,
+  getInitialLeadMs,
+  getTotalMs,
+  type CueEvent,
+  type CueSchedule,
+  type LoopCueMode,
+  type TimerSettings,
+} from '@/lib/cueScheduler';
 
-type TimerSettings = {
-  intervalSeconds: number;
-  reps: number;
-  reminderEnabled: boolean;
-  reminderSeconds: number;
-  countdownSeconds: number;
-  audioLeadMs: number;
-  markHeardLeadMs: number;
-  loopCueMode: LoopCueMode;
-};
+type TimerStatus = 'idle' | 'readying' | 'running' | 'paused' | 'complete';
 
 type TimerSnapshot = {
   elapsedMs: number;
@@ -61,21 +58,20 @@ type SplitTime = {
 };
 
 const DEFAULT_SETTINGS: TimerSettings = {
+  audioLeadMs: 300,
+  countdownSeconds: 5,
   intervalSeconds: 60,
-  reps: 10,
+  loopCueMode: 'countdown',
+  markHeardLeadMs: 2300,
   reminderEnabled: true,
   reminderSeconds: 5,
-  countdownSeconds: 5,
-  audioLeadMs: 300,
-  markHeardLeadMs: 2300,
-  loopCueMode: 'countdown',
+  reps: 10,
 };
 
 const KEEP_AWAKE_TAG = 'setpace-running-timer';
 const MARK_AUDIO_DURATION_MS = 1000;
 const MIN_MARK_TO_START_GAP_MS = 500;
 const MIN_MARK_HEARD_LEAD_MS = MARK_AUDIO_DURATION_MS + MIN_MARK_TO_START_GAP_MS;
-const COUNTDOWN_FIRST_CUE_SETTLE_MS = 180;
 
 function RunningWakeLock() {
   useKeepAwake(KEEP_AWAKE_TAG);
@@ -155,17 +151,17 @@ function parseSettings(
   return {
     errors,
     settings: {
+      audioLeadMs,
+      countdownSeconds,
       intervalSeconds,
-      reps,
+      loopCueMode,
+      markHeardLeadMs,
       reminderEnabled,
       reminderSeconds:
         Number.isFinite(reminderSeconds) && reminderSeconds >= 1
           ? reminderSeconds
           : DEFAULT_SETTINGS.reminderSeconds,
-      countdownSeconds,
-      audioLeadMs,
-      markHeardLeadMs,
-      loopCueMode,
+      reps,
     },
   };
 }
@@ -252,6 +248,7 @@ function getUpcomingCue(
 
   if (
     hasNextRep &&
+    settings.loopCueMode === 'countdown' &&
     settings.countdownSeconds > 0 &&
     secondsLeft <= settings.countdownSeconds
   ) {
@@ -260,12 +257,15 @@ function getUpcomingCue(
 
   if (
     nextReminderMs !== null &&
-    (!hasNextRep || settings.countdownSeconds === 0 || nextReminderMs < countdownStartMs)
+    (!hasNextRep ||
+      settings.loopCueMode !== 'countdown' ||
+      settings.countdownSeconds === 0 ||
+      nextReminderMs < countdownStartMs)
   ) {
     return `Reminder in ${formatSeconds(nextReminderMs - timeIntoCurrentRepMs)}`;
   }
 
-  if (hasNextRep && settings.countdownSeconds > 0) {
+  if (hasNextRep && settings.loopCueMode === 'countdown' && settings.countdownSeconds > 0) {
     return `Countdown starts in ${formatSeconds(countdownStartMs - timeIntoCurrentRepMs)}`;
   }
 
@@ -282,15 +282,15 @@ function buildSnapshot(
   status: TimerStatus
 ): TimerSnapshot {
   const intervalMs = settings.intervalSeconds * 1000;
-  const totalMs = intervalMs * settings.reps;
+  const totalMs = getTotalMs(settings);
   const safeElapsedMs = Math.min(Math.max(0, elapsedMs), totalMs);
 
   if (status === 'complete' || safeElapsedMs >= totalMs) {
     return {
-      elapsedMs: totalMs,
-      currentRepIndex: settings.reps - 1,
-      timeToNextStartMs: 0,
       countdownSecond: null,
+      currentRepIndex: settings.reps - 1,
+      elapsedMs: totalMs,
+      timeToNextStartMs: 0,
       upcomingCue: 'Set complete',
     };
   }
@@ -300,15 +300,16 @@ function buildSnapshot(
   const timeToNextStartMs = intervalMs - timeIntoCurrentRepMs;
   const secondsLeft = Math.max(1, Math.ceil(timeToNextStartMs / 1000));
   const isFinalCountdown =
+    settings.loopCueMode === 'countdown' &&
     currentRepIndex < settings.reps - 1 &&
     settings.countdownSeconds > 0 &&
     secondsLeft <= settings.countdownSeconds;
 
   return {
-    elapsedMs: safeElapsedMs,
-    currentRepIndex,
-    timeToNextStartMs,
     countdownSecond: isFinalCountdown ? secondsLeft : null,
+    currentRepIndex,
+    elapsedMs: safeElapsedMs,
+    timeToNextStartMs,
     upcomingCue: getUpcomingCue(
       timeIntoCurrentRepMs,
       timeToNextStartMs,
@@ -318,25 +319,19 @@ function buildSnapshot(
   };
 }
 
-function getTotalMs(settings: TimerSettings) {
-  return settings.intervalSeconds * 1000 * settings.reps;
-}
-
 function sanitizeDigits(value: string) {
   return value.replace(/[^\d]/g, '');
 }
 
-function getStartRepIndexFromKey(key: string) {
-  const match = /^start-(\d+)$/.exec(key);
-  return match ? Number.parseInt(match[1], 10) : undefined;
+function getRunCueKey(runSequence: number, event: CueEvent) {
+  return `${runSequence}:${event.key}`;
 }
 
 export default function HomeScreen() {
   const [status, setStatus] = useState<TimerStatus>('idle');
   const [audioReady, setAudioReady] = useState(isCueAudioReady());
-  const [audioPreparing, setAudioPreparing] = useState(!isCueAudioReady());
   const [audioStatusText, setAudioStatusText] = useState(
-    isCueAudioReady() ? 'Audio ready' : 'Preparing audio...'
+    isCueAudioReady() ? 'Audio ready' : 'Preparing sound'
   );
   const [intervalSeconds, setIntervalSeconds] = useState(String(DEFAULT_SETTINGS.intervalSeconds));
   const [reps, setReps] = useState(String(DEFAULT_SETTINGS.reps));
@@ -359,29 +354,29 @@ export default function HomeScreen() {
   const startedAtRef = useRef<number | null>(null);
   const pausedElapsedMsRef = useRef(0);
   const frameRef = useRef<number | null>(null);
-  const preStartTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const preStartFrameRef = useRef<number | null>(null);
-  const preStartEndsAtRef = useRef<number | null>(null);
   const activeSettingsRef = useRef<TimerSettings | null>(null);
+  const activeCueScheduleRef = useRef<CueSchedule | null>(null);
   const firedCueKeysRef = useRef<Set<string>>(new Set());
-  const pendingStartCueKeysRef = useRef<Set<string>>(new Set());
-  const markCueLockUntilRef = useRef(0);
+  const skippedCueKeysRef = useRef<Set<string>>(new Set());
+  const completeCueFiredRef = useRef(false);
   const appStateRef = useRef(AppState.currentState);
   const runSequenceRef = useRef(0);
-  const startRequestIdRef = useRef(0);
   const splitCounterRef = useRef(0);
-  const startRequestInProgressRef = useRef(false);
 
   const parsed = useMemo(
     () =>
-      parseSettings({
-        intervalSeconds,
-        reps,
-        reminderSeconds,
-        countdownSeconds,
-        audioLeadMs,
-        markHeardLeadMs,
-      }, loopCueMode, reminderEnabled),
+      parseSettings(
+        {
+          audioLeadMs,
+          countdownSeconds,
+          intervalSeconds,
+          markHeardLeadMs,
+          reminderSeconds,
+          reps,
+        },
+        loopCueMode,
+        reminderEnabled
+      ),
     [
       audioLeadMs,
       countdownSeconds,
@@ -396,7 +391,7 @@ export default function HomeScreen() {
 
   const displayedSettings = activeSettings ?? parsed.settings ?? DEFAULT_SETTINGS;
   const controlsLocked = status === 'readying' || status === 'running' || status === 'paused';
-  const canStart = !controlsLocked && parsed.settings !== null && !audioPreparing;
+  const canStart = !controlsLocked && parsed.settings !== null;
   const isStarted =
     status === 'readying' || status === 'running' || status === 'paused' || status === 'complete';
   const canSplit = (status === 'running' || status === 'paused') && activeSettings !== null;
@@ -410,10 +405,10 @@ export default function HomeScreen() {
           : 'Start'
         : String(preStartCountdownSecond)
       : status === 'complete'
-      ? 'Done'
-      : snapshot.countdownSecond !== null
-        ? String(snapshot.countdownSecond)
-        : formatClock(Math.ceil(snapshot.timeToNextStartMs / 1000));
+        ? 'Done'
+        : snapshot.countdownSecond !== null
+          ? String(snapshot.countdownSecond)
+          : formatClock(Math.ceil(snapshot.timeToNextStartMs / 1000));
   const statusText =
     status === 'readying'
       ? displayedSettings.loopCueMode === 'countdown'
@@ -424,7 +419,7 @@ export default function HomeScreen() {
     status === 'readying'
       ? displayedSettings.loopCueMode === 'countdown'
         ? 'Start rep 1 after countdown'
-        : 'Start rep 1 after the start beep'
+        : 'Start rep 1 after Take your marks'
       : snapshot.upcomingCue;
   const intervalMs = displayedSettings.intervalSeconds * 1000;
   const loopElapsedMs = Math.min(
@@ -433,93 +428,137 @@ export default function HomeScreen() {
   );
   const loopTimeDisplay = formatPreciseClock(loopElapsedMs);
   const elapsedDisplay = formatClock(Math.floor(snapshot.elapsedMs / 1000));
-  const repProgress =
-    status === 'complete'
-      ? 1
-      : 1 - snapshot.timeToNextStartMs / intervalMs;
+  const repProgress = status === 'complete' ? 1 : 1 - snapshot.timeToNextStartMs / intervalMs;
 
   const refreshAudioStatus = useCallback(() => {
     const cueAudioState = getCueAudioState();
     const ready = cueAudioState.audioReady && cueAudioState.warmupComplete;
 
     setAudioReady(ready);
-    setAudioPreparing(cueAudioState.preparing);
     setAudioStatusText(
       ready
         ? 'Audio ready'
         : cueAudioState.lastError
-          ? 'Audio unavailable'
-          : cueAudioState.preparing
-            ? 'Preparing audio...'
-            : 'Audio not ready'
+          ? 'Sound unavailable'
+          : 'Preparing sound'
     );
 
     return ready;
   }, []);
 
   const prepareCueAudio = useCallback(async () => {
-    setAudioPreparing(true);
-    setAudioReady(false);
-    setAudioStatusText('Preparing audio...');
-    setCueText((currentCueText) =>
-      currentCueText === 'Ready' || currentCueText === 'Audio ready'
-        ? 'Preparing audio...'
-        : currentCueText
-    );
+    setAudioStatusText('Preparing sound');
 
     try {
-      await ensureAudioReady();
-      refreshAudioStatus();
-      setCueText((currentCueText) =>
-        currentCueText === 'Preparing audio...' ? 'Ready' : currentCueText
-      );
-      return true;
+      await prepareAudioBestEffort();
+      return refreshAudioStatus();
     } catch {
-      refreshAudioStatus();
-      setCueText((currentCueText) =>
-        currentCueText === 'Preparing audio...' ? 'Ready' : currentCueText
-      );
-      return false;
-    } finally {
-      setAudioPreparing(false);
+      return refreshAudioStatus();
     }
   }, [refreshAudioStatus]);
 
-  useEffect(() => {
-    let active = true;
+  const dispatchScheduledCue = useCallback((event: CueEvent, runSequence: number) => {
+    const runCueKey = getRunCueKey(runSequence, event);
 
-    setAudioPreparing(true);
-    setAudioReady(false);
-    setAudioStatusText('Preparing audio...');
-    setCueText('Preparing audio...');
+    if (firedCueKeysRef.current.has(runCueKey) || skippedCueKeysRef.current.has(runCueKey)) {
+      return;
+    }
 
-    void ensureAudioReady()
-      .then(() => {
-        if (!active) {
-          return;
-        }
+    setCueText(event.text);
 
-        refreshAudioStatus();
-        setCueText('Ready');
-      })
-      .catch(() => {
-        if (!active) {
-          return;
-        }
+    if (Platform.OS === 'android' && event.vibrationMs > 0) {
+      Vibration.vibrate(event.vibrationMs);
+    }
 
-        refreshAudioStatus();
-        setCueText('Ready');
-      })
-      .finally(() => {
-        if (active) {
-          setAudioPreparing(false);
-        }
+    try {
+      if (event.kind === 'start') {
+        void playStartCue({
+          cueKey: event.key,
+          repIndex: event.repIndex,
+          runSequence,
+        });
+      } else if (event.kind === 'countdown') {
+        void playCountdownCue({
+          cueKey: event.key,
+          repIndex: event.repIndex,
+          runSequence,
+        });
+      } else if (event.kind === 'mark') {
+        void playMarkCue({
+          cueKey: event.key,
+          repIndex: event.repIndex,
+          runSequence,
+        });
+      } else {
+        void playReminderCue({
+          cueKey: event.key,
+          repIndex: event.repIndex,
+          runSequence,
+        });
+      }
+    } catch (error) {
+      cueAudioLog('cue dispatch threw synchronously', {
+        cueKey: event.key,
+        error: String(error),
+        kind: event.kind,
+        runSequence,
+      });
+    }
+
+    firedCueKeysRef.current.add(runCueKey);
+  }, []);
+
+  const processDueCueEvents = useCallback(
+    (now: number, schedule: CueSchedule) => {
+      const isHandled = (event: CueEvent) => {
+        const runCueKey = getRunCueKey(schedule.runSequence, event);
+        return (
+          firedCueKeysRef.current.has(runCueKey) || skippedCueKeysRef.current.has(runCueKey)
+        );
+      };
+      const { due, expired } = getDueCueEvents(schedule, now, isHandled);
+
+      expired.forEach((event) => {
+        const runCueKey = getRunCueKey(schedule.runSequence, event);
+        skippedCueKeysRef.current.add(runCueKey);
+        cueAudioLog('cue skipped after expiry', {
+          cueKey: event.key,
+          expiresAt: event.expiresAt,
+          fireAt: event.fireAt,
+          kind: event.kind,
+          now,
+          runSequence: schedule.runSequence,
+        });
       });
 
-    return () => {
-      active = false;
-    };
-  }, [refreshAudioStatus]);
+      due.forEach((event) => {
+        dispatchScheduledCue(event, schedule.runSequence);
+      });
+    },
+    [dispatchScheduledCue]
+  );
+
+  const dispatchCompleteCue = useCallback(() => {
+    if (completeCueFiredRef.current) {
+      return;
+    }
+
+    completeCueFiredRef.current = true;
+    setCueText('Set complete');
+
+    if (Platform.OS === 'android') {
+      Vibration.vibrate(180);
+    }
+
+    void playCompleteCue({
+      cueKey: 'complete',
+      runSequence: runSequenceRef.current,
+    });
+  }, []);
+
+  useEffect(() => {
+    void prepareCueAudio();
+  }, [prepareCueAudio]);
 
   useEffect(() => {
     const subscription = AppState.addEventListener('change', (nextState) => {
@@ -534,45 +573,13 @@ export default function HomeScreen() {
       }
 
       invalidateCueAudio('app-foreground');
-
-      if (status === 'readying' || status === 'running') {
-        void ensureAudioReady()
-          .then(refreshAudioStatus)
-          .catch(refreshAudioStatus);
-        return;
-      }
-
       void prepareCueAudio();
     });
 
     return () => {
       subscription.remove();
     };
-  }, [prepareCueAudio, refreshAudioStatus, status]);
-
-  const clearPreStartTimers = useCallback((resetDisplay = true) => {
-    if (preStartTimeoutRef.current !== null) {
-      clearTimeout(preStartTimeoutRef.current);
-      preStartTimeoutRef.current = null;
-    }
-
-    if (preStartFrameRef.current !== null) {
-      cancelAnimationFrame(preStartFrameRef.current);
-      preStartFrameRef.current = null;
-    }
-
-    preStartEndsAtRef.current = null;
-    if (resetDisplay) {
-      setPreStartCountdownSecond(null);
-    }
-  }, []);
-
-  useEffect(
-    () => () => {
-      clearPreStartTimers(false);
-    },
-    [clearPreStartTimers]
-  );
+  }, [prepareCueAudio]);
 
   useEffect(() => {
     if (status === 'idle') {
@@ -580,21 +587,29 @@ export default function HomeScreen() {
     }
   }, [parsed.settings, status]);
 
-  const markReadyForNewConfig = useCallback(() => {
-    if (status !== 'complete') {
+  const clearIdleCueState = useCallback(() => {
+    if (status === 'readying' || status === 'running' || status === 'paused') {
       return;
     }
 
-    activeSettingsRef.current = null;
-    setActiveSettings(null);
-    pausedElapsedMsRef.current = 0;
+    activeCueScheduleRef.current = null;
     firedCueKeysRef.current.clear();
-    pendingStartCueKeysRef.current.clear();
-    markCueLockUntilRef.current = 0;
-    splitCounterRef.current = 0;
-    setSplits([]);
-    setCueText('Ready');
-    setStatus('idle');
+    skippedCueKeysRef.current.clear();
+    completeCueFiredRef.current = false;
+    setPreStartCountdownSecond(null);
+    stopAllCues();
+    Vibration.cancel();
+
+    if (status === 'complete') {
+      activeSettingsRef.current = null;
+      setActiveSettings(null);
+      startedAtRef.current = null;
+      pausedElapsedMsRef.current = 0;
+      splitCounterRef.current = 0;
+      setSplits([]);
+      setCueText('Ready');
+      setStatus('idle');
+    }
   }, [status]);
 
   const updateInput = useCallback(
@@ -603,223 +618,21 @@ export default function HomeScreen() {
         return;
       }
 
-      markReadyForNewConfig();
+      clearIdleCueState();
       setter(sanitizeDigits(value));
     },
-    [controlsLocked, markReadyForNewConfig]
-  );
-
-  const fireCue = useCallback(
-    (
-      key: string,
-      text: string,
-      durationMs = 80,
-      sound: 'start' | 'countdown' | 'mark' | 'complete' | 'reminder' = 'start'
-    ) => {
-      const runSequence = runSequenceRef.current;
-      const dedupeKey = `${runSequence}:${key}`;
-
-      if (sound === 'start' && pendingStartCueKeysRef.current.has(dedupeKey)) {
-        return false;
-      }
-
-      if (firedCueKeysRef.current.has(dedupeKey)) {
-        return false;
-      }
-
-      if (sound === 'mark' && Date.now() < markCueLockUntilRef.current) {
-        firedCueKeysRef.current.add(dedupeKey);
-        return false;
-      }
-
-      if (
-        (sound === 'countdown' || sound === 'reminder') &&
-        Date.now() < markCueLockUntilRef.current
-      ) {
-        firedCueKeysRef.current.add(dedupeKey);
-        return false;
-      }
-
-      setCueText(text);
-
-      if (sound === 'mark') {
-        firedCueKeysRef.current.add(dedupeKey);
-        markCueLockUntilRef.current = Date.now() + MARK_AUDIO_DURATION_MS + 100;
-        void playMarkCue({ cueKey: key, runSequence }).catch(() => undefined);
-      } else if (sound === 'countdown') {
-        firedCueKeysRef.current.add(dedupeKey);
-        void playCountdownCue({ cueKey: key, runSequence }).catch(() => undefined);
-      } else if (sound === 'complete') {
-        firedCueKeysRef.current.add(dedupeKey);
-        void playCompleteCue({ cueKey: key, runSequence }).catch(() => undefined);
-      } else if (sound === 'reminder') {
-        firedCueKeysRef.current.add(dedupeKey);
-        void playStartCue({ cueKey: key, runSequence }).catch(() => undefined);
-      } else {
-        const repIndex = getStartRepIndexFromKey(key);
-
-        pendingStartCueKeysRef.current.add(dedupeKey);
-        void playStartCue({ cueKey: key, repIndex, runSequence })
-          .then(() => {
-            if (runSequenceRef.current === runSequence) {
-              firedCueKeysRef.current.add(dedupeKey);
-            }
-          })
-          .catch(() => {
-            if (runSequenceRef.current === runSequence) {
-              firedCueKeysRef.current.add(dedupeKey);
-            }
-          })
-          .finally(() => {
-            pendingStartCueKeysRef.current.delete(dedupeKey);
-          });
-      }
-
-      if (Platform.OS === 'android') {
-        Vibration.vibrate(durationMs);
-      }
-
-      return true;
-    },
-    [playCompleteCue, playCountdownCue, playMarkCue, playStartCue]
-  );
-
-  const processCues = useCallback(
-    (now: number, elapsedMs: number, settings: TimerSettings) => {
-      const activeStartedAt = startedAtRef.current;
-
-      if (activeStartedAt === null) {
-        return;
-      }
-
-      const setStartAt = activeStartedAt - pausedElapsedMsRef.current;
-      const intervalMs = settings.intervalSeconds * 1000;
-      const currentRepIndex = Math.floor(elapsedMs / intervalMs);
-
-      if (currentRepIndex >= settings.reps) {
-        return;
-      }
-
-      const timeIntoCurrentRepMs = elapsedMs - currentRepIndex * intervalMs;
-      const currentRepNumber = currentRepIndex + 1;
-      const hasNextRep = currentRepIndex < settings.reps - 1;
-      const repIndicesToCheck = Array.from(
-        new Set([currentRepIndex, Math.min(currentRepIndex + 1, settings.reps - 1)])
-      );
-
-      for (const repIndex of repIndicesToCheck) {
-        const repStartAt = setStartAt + repIndex * intervalMs;
-        const startCueFireAt = repStartAt - settings.audioLeadMs;
-
-        if (now >= startCueFireAt && fireCue(`start-${repIndex}`, `Start rep ${repIndex + 1}`, 130)) {
-          return;
-        }
-      }
-
-      if (settings.loopCueMode === 'mark' && hasNextRep) {
-        const nextRepIndex = currentRepIndex + 1;
-        const nextRepStartAt = setStartAt + nextRepIndex * intervalMs;
-        const startCueFireAt = nextRepStartAt - settings.audioLeadMs;
-        const markCueFireAt = startCueFireAt - settings.markHeardLeadMs;
-
-        if (
-          now >= markCueFireAt &&
-          now < startCueFireAt - MIN_MARK_TO_START_GAP_MS &&
-          fireCue(`mark-${nextRepIndex}`, 'Take your marks', 70, 'mark')
-        ) {
-          return;
-        }
-      }
-
-      if (
-        settings.loopCueMode === 'countdown' &&
-        settings.countdownSeconds > 0
-      ) {
-        const nextCountdownRepIndex = elapsedMs <= 0 ? 0 : currentRepIndex + 1;
-
-        if (nextCountdownRepIndex < settings.reps) {
-          const nextRepStartAt = setStartAt + nextCountdownRepIndex * intervalMs;
-          const startCueFireAt = nextRepStartAt - settings.audioLeadMs;
-
-          for (let secondsLeft = settings.countdownSeconds; secondsLeft >= 1; secondsLeft -= 1) {
-            const countdownCueFireAt = nextRepStartAt - secondsLeft * 1000 - settings.audioLeadMs;
-
-            if (
-              now >= countdownCueFireAt &&
-              now < startCueFireAt &&
-              fireCue(
-                `countdown-${nextCountdownRepIndex}-${secondsLeft}`,
-                String(secondsLeft),
-                70,
-                'countdown'
-              )
-            ) {
-              return;
-            }
-          }
-        }
-      }
-
-      if (settings.reminderEnabled) {
-        const countdownStartMs = intervalMs - settings.countdownSeconds * 1000;
-        const currentRepStartAt = setStartAt + currentRepIndex * intervalMs;
-        const nextRepStartAt = currentRepStartAt + intervalMs;
-        const markCueFireAt =
-          settings.loopCueMode === 'mark' && hasNextRep
-            ? nextRepStartAt - settings.audioLeadMs - settings.markHeardLeadMs
-            : null;
-        const startCueFireAt = nextRepStartAt - settings.audioLeadMs;
-
-        for (
-          let reminderSecond = settings.reminderSeconds;
-          reminderSecond < settings.intervalSeconds;
-          reminderSecond += settings.reminderSeconds
-        ) {
-          const reminderTargetMs = reminderSecond * 1000;
-          const reminderCueFireAt = currentRepStartAt + reminderTargetMs - settings.audioLeadMs;
-          const overlapsCountdown =
-            hasNextRep &&
-            settings.loopCueMode === 'countdown' &&
-            settings.countdownSeconds > 0 &&
-            reminderTargetMs >= countdownStartMs;
-          const overlapsMark =
-            markCueFireAt !== null &&
-            reminderCueFireAt >= markCueFireAt &&
-            reminderCueFireAt < startCueFireAt;
-
-          if (
-            !overlapsCountdown &&
-            !overlapsMark &&
-            now >= reminderCueFireAt &&
-            now < reminderCueFireAt + 1000 &&
-            fireCue(
-              `reminder-${currentRepIndex}-${reminderSecond}`,
-              `Rep ${currentRepNumber}: ${reminderSecond}s`,
-              100,
-              'reminder'
-            )
-          ) {
-            return;
-          }
-        }
-      }
-    },
-    [fireCue]
+    [clearIdleCueState, controlsLocked]
   );
 
   const getRunningElapsedMs = useCallback((settings: TimerSettings) => {
     const baseElapsedMs =
-      startedAtRef.current === null
-        ? pausedElapsedMsRef.current
-        : Date.now() - startedAtRef.current + pausedElapsedMsRef.current;
+      startedAtRef.current === null ? pausedElapsedMsRef.current : Date.now() - startedAtRef.current;
 
     return Math.min(Math.max(0, baseElapsedMs), getTotalMs(settings));
   }, []);
 
   const getRawElapsedMs = useCallback(() => {
-    return startedAtRef.current === null
-      ? pausedElapsedMsRef.current
-      : Date.now() - startedAtRef.current + pausedElapsedMsRef.current;
+    return startedAtRef.current === null ? pausedElapsedMsRef.current : Date.now() - startedAtRef.current;
   }, []);
 
   useEffect(() => {
@@ -831,41 +644,42 @@ export default function HomeScreen() {
 
     const tick = () => {
       const settings = activeSettingsRef.current;
+      const schedule = activeCueScheduleRef.current;
 
-      if (!active || settings === null) {
+      if (!active || settings === null || schedule === null) {
         return;
       }
 
       const now = Date.now();
       const rawElapsedMs = getRawElapsedMs();
-      const elapsedMs = Math.min(Math.max(0, rawElapsedMs), getTotalMs(settings));
+      const totalMs = getTotalMs(settings);
+      const elapsedMs = Math.min(Math.max(0, rawElapsedMs), totalMs);
 
       if (rawElapsedMs < 0) {
-        const preStartRemainingMs =
-          settings.loopCueMode === 'countdown'
-            ? Math.max(
-                0,
-                Math.abs(rawElapsedMs) - settings.audioLeadMs - COUNTDOWN_FIRST_CUE_SETTLE_MS
-              )
-            : Math.abs(rawElapsedMs);
-        setPreStartCountdownSecond(Math.max(1, Math.ceil(preStartRemainingMs / 1000)));
+        if (settings.loopCueMode === 'countdown' && settings.countdownSeconds > 0) {
+          const visiblePreStartMs = Math.max(0, Math.abs(rawElapsedMs) - settings.audioLeadMs);
+          setPreStartCountdownSecond(Math.max(1, Math.ceil(visiblePreStartMs / 1000)));
+        } else {
+          setPreStartCountdownSecond(null);
+        }
       } else if (status === 'readying') {
         setPreStartCountdownSecond(null);
         setStatus('running');
       }
 
-      if (elapsedMs >= getTotalMs(settings)) {
-        pausedElapsedMsRef.current = getTotalMs(settings);
+      processDueCueEvents(now, schedule);
+
+      if (elapsedMs >= totalMs) {
+        pausedElapsedMsRef.current = totalMs;
         startedAtRef.current = null;
-        setSnapshot(buildSnapshot(getTotalMs(settings), settings, 'complete'));
-        fireCue('complete', 'Set complete', 180, 'complete');
+        activeCueScheduleRef.current = null;
+        setSnapshot(buildSnapshot(totalMs, settings, 'complete'));
+        dispatchCompleteCue();
         setStatus('complete');
         return;
       }
 
-      // The frame loop only schedules rendering; all timer values come from absolute timestamps.
-      setSnapshot(buildSnapshot(elapsedMs, settings, 'running'));
-      processCues(now, elapsedMs, settings);
+      setSnapshot(buildSnapshot(elapsedMs, settings, rawElapsedMs < 0 ? 'readying' : 'running'));
       frameRef.current = requestAnimationFrame(tick);
     };
 
@@ -879,117 +693,50 @@ export default function HomeScreen() {
         frameRef.current = null;
       }
     };
-  }, [fireCue, getRawElapsedMs, processCues, status]);
+  }, [dispatchCompleteCue, getRawElapsedMs, processDueCueEvents, status]);
 
   const startSet = useCallback(() => {
-    if (startRequestInProgressRef.current) {
+    const settings = parsed.settings;
+
+    if (settings === null) {
       return;
     }
 
-    const requestedSettings = parsed.settings;
-
-    if (requestedSettings === null) {
-      return;
-    }
-
-    const requestId = startRequestIdRef.current + 1;
+    const now = Date.now();
     const runSequence = runSequenceRef.current + 1;
+    const intendedStartAt = now + getInitialLeadMs(settings);
+    const schedule = createCueSchedule({
+      runSequence,
+      settings,
+      startedAt: intendedStartAt,
+    });
 
-    startRequestIdRef.current = requestId;
     runSequenceRef.current = runSequence;
     setCueAudioRunSequence(runSequence);
-    recreateCuePlayersForRun('start-request');
-    startRequestInProgressRef.current = true;
-    setAudioPreparing(true);
-    setAudioStatusText('Preparing cues...');
-    clearPreStartTimers();
+    stopAllCues();
+    Vibration.cancel();
+    firedCueKeysRef.current.clear();
+    skippedCueKeysRef.current.clear();
+    completeCueFiredRef.current = false;
+    activeSettingsRef.current = settings;
+    activeCueScheduleRef.current = schedule;
+    startedAtRef.current = intendedStartAt;
+    pausedElapsedMsRef.current = 0;
+    splitCounterRef.current = 0;
+    setActiveSettings(settings);
+    setSplits([]);
+    setSnapshot(buildSnapshot(0, settings, 'readying'));
+    setPreStartCountdownSecond(
+      settings.loopCueMode === 'countdown' && settings.countdownSeconds > 0
+        ? settings.countdownSeconds
+        : null
+    );
+    setCueText('Ready');
+    setStatus('readying');
 
-    const isCurrentStartRequest = () =>
-      requestId === startRequestIdRef.current && runSequence === runSequenceRef.current;
-
-    void (async () => {
-      if (!audioReady || !isCueAudioReady()) {
-        await prepareCueAudio();
-      }
-
-      if (!isCurrentStartRequest()) {
-        return;
-      }
-
-      await primeStartCueAfterInteraction({ runSequence }).catch(() => undefined);
-
-      if (!isCurrentStartRequest()) {
-        return;
-      }
-
-      refreshAudioStatus();
-
-      const settings = requestedSettings;
-
-      const now = Date.now();
-      const firstCountdownDelayMs =
-        settings.loopCueMode === 'countdown' && settings.countdownSeconds > 0
-          ? COUNTDOWN_FIRST_CUE_SETTLE_MS
-          : 0;
-      const initialLeadMs =
-        settings.loopCueMode === 'mark'
-          ? settings.audioLeadMs + settings.markHeardLeadMs
-          : settings.audioLeadMs + settings.countdownSeconds * 1000 + firstCountdownDelayMs;
-      const intendedStartAt = now + initialLeadMs;
-
-      activeSettingsRef.current = settings;
-      setActiveSettings(settings);
-      firedCueKeysRef.current.clear();
-      pendingStartCueKeysRef.current.clear();
-      markCueLockUntilRef.current = 0;
-      splitCounterRef.current = 0;
-      pausedElapsedMsRef.current = 0;
-      startedAtRef.current = intendedStartAt;
-      setSplits([]);
-      setSnapshot(buildSnapshot(0, settings, 'readying'));
-      setPreStartCountdownSecond(
-        settings.loopCueMode === 'countdown' && settings.countdownSeconds > 0
-          ? settings.countdownSeconds
-          : Math.max(1, Math.ceil(initialLeadMs / 1000))
-      );
-      setStatus('readying');
-
-      if (settings.loopCueMode === 'mark') {
-        fireCue('prestart-mark', 'Take your marks', 70, 'mark');
-      } else if (settings.countdownSeconds > 0) {
-        preStartTimeoutRef.current = setTimeout(() => {
-          preStartTimeoutRef.current = null;
-
-          if (!isCurrentStartRequest()) {
-            return;
-          }
-
-          fireCue(
-            `countdown-0-${settings.countdownSeconds}`,
-            String(settings.countdownSeconds),
-            70,
-            'countdown'
-          );
-        }, firstCountdownDelayMs);
-      } else {
-        setCueText('Ready');
-      }
-    })()
-      .catch(() => undefined)
-      .finally(() => {
-        if (requestId === startRequestIdRef.current) {
-          startRequestInProgressRef.current = false;
-          setAudioPreparing(false);
-        }
-      });
-  }, [
-    audioReady,
-    clearPreStartTimers,
-    fireCue,
-    parsed.settings,
-    prepareCueAudio,
-    refreshAudioStatus,
-  ]);
+    processDueCueEvents(now, schedule);
+    void prepareCueAudio();
+  }, [parsed.settings, prepareCueAudio, processDueCueEvents]);
 
   const pauseSet = useCallback(() => {
     const settings = activeSettingsRef.current;
@@ -1001,17 +748,29 @@ export default function HomeScreen() {
     const elapsedMs = getRunningElapsedMs(settings);
     pausedElapsedMsRef.current = elapsedMs;
     startedAtRef.current = null;
+    activeCueScheduleRef.current = null;
     setSnapshot(buildSnapshot(elapsedMs, settings, 'paused'));
     setCueText('Paused');
     setStatus('paused');
   }, [getRunningElapsedMs, status]);
 
   const resumeSet = useCallback(() => {
-    if (status !== 'paused' || activeSettingsRef.current === null) {
+    const settings = activeSettingsRef.current;
+
+    if (status !== 'paused' || settings === null) {
       return;
     }
 
-    startedAtRef.current = Date.now();
+    const resumedStartAt = Date.now() - pausedElapsedMsRef.current;
+    const schedule = createCueSchedule({
+      runSequence: runSequenceRef.current,
+      settings,
+      startedAt: resumedStartAt,
+    });
+
+    startedAtRef.current = resumedStartAt;
+    pausedElapsedMsRef.current = 0;
+    activeCueScheduleRef.current = schedule;
     setCueText('Resumed');
     setStatus('running');
   }, [status]);
@@ -1019,30 +778,26 @@ export default function HomeScreen() {
   const resetSet = useCallback(() => {
     const nextSettings = parsed.settings ?? DEFAULT_SETTINGS;
 
-    startRequestIdRef.current += 1;
-    startRequestInProgressRef.current = false;
-    clearPreStartTimers();
     runSequenceRef.current += 1;
     setCueAudioRunSequence(runSequenceRef.current);
-
     startedAtRef.current = null;
     activeSettingsRef.current = null;
+    activeCueScheduleRef.current = null;
     pausedElapsedMsRef.current = 0;
     firedCueKeysRef.current.clear();
-    pendingStartCueKeysRef.current.clear();
-    markCueLockUntilRef.current = 0;
+    skippedCueKeysRef.current.clear();
+    completeCueFiredRef.current = false;
     splitCounterRef.current = 0;
     stopAllCues();
-    recreateCuePlayersForRun('reset');
     Vibration.cancel();
     setActiveSettings(null);
     setSplits([]);
     setSnapshot(buildSnapshot(0, nextSettings, 'idle'));
+    setPreStartCountdownSecond(null);
     setCueText('Ready');
-    setAudioPreparing(false);
     refreshAudioStatus();
     setStatus('idle');
-  }, [clearPreStartTimers, parsed.settings, refreshAudioStatus]);
+  }, [parsed.settings, refreshAudioStatus]);
 
   const updateLoopCueMode = useCallback(
     (mode: LoopCueMode) => {
@@ -1050,10 +805,10 @@ export default function HomeScreen() {
         return;
       }
 
-      markReadyForNewConfig();
+      clearIdleCueState();
       setLoopCueMode(mode);
     },
-    [controlsLocked, markReadyForNewConfig]
+    [clearIdleCueState, controlsLocked]
   );
 
   const updateReminderEnabled = useCallback(
@@ -1062,10 +817,10 @@ export default function HomeScreen() {
         return;
       }
 
-      markReadyForNewConfig();
+      clearIdleCueState();
       setReminderEnabled(enabled);
     },
-    [controlsLocked, markReadyForNewConfig]
+    [clearIdleCueState, controlsLocked]
   );
 
   const recordSplit = useCallback(() => {
@@ -1083,8 +838,8 @@ export default function HomeScreen() {
     splitCounterRef.current = splitId;
     setSplits((currentSplits) => [
       {
-        id: splitId,
         elapsedMs,
+        id: splitId,
         repElapsedMs: elapsedMs - repIndex * intervalMs,
         repNumber: repIndex + 1,
       },
@@ -1102,237 +857,232 @@ export default function HomeScreen() {
           keyboardVerticalOffset={0}
           style={styles.keyboardAvoider}>
           <ScrollView
+            contentContainerStyle={styles.content}
             keyboardDismissMode="on-drag"
             keyboardShouldPersistTaps="handled"
-            contentContainerStyle={styles.content}
             showsVerticalScrollIndicator={false}>
-          <View style={styles.header}>
-            <Text style={styles.brand}>SetPace</Text>
-            <View style={styles.headerMeta}>
-              <Text style={styles.statusLabel}>{statusText}</Text>
-              <Text style={[styles.audioStatus, audioReady && styles.audioStatusReady]}>
-                {audioStatusText}
+            <View style={styles.header}>
+              <Text style={styles.brand}>SetPace</Text>
+              <View style={styles.headerMeta}>
+                <Text style={styles.statusLabel}>{statusText}</Text>
+                <Text style={[styles.audioStatus, audioReady && styles.audioStatusReady]}>
+                  {audioStatusText}
+                </Text>
+              </View>
+            </View>
+
+            <View style={styles.timerPanel}>
+              <Text style={styles.timerLabel}>Loop time</Text>
+              <Text adjustsFontSizeToFit numberOfLines={1} style={styles.countdown}>
+                {loopTimeDisplay}
               </Text>
-            </View>
-          </View>
 
-          <View style={styles.timerPanel}>
-            <Text style={styles.timerLabel}>Loop time</Text>
-            <Text
-              style={styles.countdown}
-              adjustsFontSizeToFit
-              numberOfLines={1}>
-              {loopTimeDisplay}
-            </Text>
-
-            <View style={styles.progressTrack}>
-              <View
-                style={[
-                  styles.progressFill,
-                  { width: `${Math.min(1, Math.max(0, repProgress)) * 100}%` },
-                ]}
-              />
-            </View>
-
-            <View style={styles.repRow}>
-              <View style={styles.metric}>
-                <Text style={styles.metricLabel}>Rep</Text>
-                <Text style={styles.metricValue}>
-                  {currentRepNumber}/{displayedSettings.reps}
-                </Text>
-              </View>
-              <View style={styles.metric}>
-                <Text style={styles.metricLabel}>Next start</Text>
-                <Text
+              <View style={styles.progressTrack}>
+                <View
                   style={[
-                    styles.metricValue,
-                    (snapshot.countdownSecond !== null || preStartCountdownSecond !== null) &&
-                      styles.metricUrgent,
-                  ]}>
-                  {countdownDisplay}
-                </Text>
+                    styles.progressFill,
+                    { width: `${Math.min(1, Math.max(0, repProgress)) * 100}%` },
+                  ]}
+                />
               </View>
-              <View style={styles.metric}>
-                <Text style={styles.metricLabel}>Elapsed</Text>
-                <Text style={styles.metricValue}>{elapsedDisplay}</Text>
+
+              <View style={styles.repRow}>
+                <View style={styles.metric}>
+                  <Text style={styles.metricLabel}>Rep</Text>
+                  <Text style={styles.metricValue}>
+                    {currentRepNumber}/{displayedSettings.reps}
+                  </Text>
+                </View>
+                <View style={styles.metric}>
+                  <Text style={styles.metricLabel}>Next start</Text>
+                  <Text
+                    style={[
+                      styles.metricValue,
+                      (snapshot.countdownSecond !== null || preStartCountdownSecond !== null) &&
+                        styles.metricUrgent,
+                    ]}>
+                    {countdownDisplay}
+                  </Text>
+                </View>
+                <View style={styles.metric}>
+                  <Text style={styles.metricLabel}>Elapsed</Text>
+                  <Text style={styles.metricValue}>{elapsedDisplay}</Text>
+                </View>
+              </View>
+
+              <View style={styles.cuePanel}>
+                <Text style={styles.cueLabel}>Cue</Text>
+                <Text style={styles.cueText}>{cueText}</Text>
+                <Text style={styles.nextCue}>{upcomingCueText}</Text>
               </View>
             </View>
 
-            <View style={styles.cuePanel}>
-              <Text style={styles.cueLabel}>Cue</Text>
-              <Text style={styles.cueText}>{cueText}</Text>
-              <Text style={styles.nextCue}>{upcomingCueText}</Text>
-            </View>
-          </View>
-
-          <View style={styles.controlRow}>
-            {status === 'running' ? (
-              <ControlButton label="Pause" onPress={pauseSet} variant="secondary" />
-            ) : status === 'paused' ? (
-              <ControlButton label="Resume" onPress={resumeSet} variant="primary" />
-            ) : status === 'readying' ? (
+            <View style={styles.controlRow}>
+              {status === 'running' ? (
+                <ControlButton label="Pause" onPress={pauseSet} variant="secondary" />
+              ) : status === 'paused' ? (
+                <ControlButton label="Resume" onPress={resumeSet} variant="primary" />
+              ) : status === 'readying' ? (
+                <ControlButton
+                  disabled
+                  label={displayedSettings.loopCueMode === 'countdown' ? 'Counting' : 'Mark'}
+                  onPress={() => undefined}
+                  variant="secondary"
+                />
+              ) : (
+                <ControlButton
+                  disabled={!canStart}
+                  label="Start"
+                  onPress={startSet}
+                  variant="primary"
+                />
+              )}
               <ControlButton
-                label={displayedSettings.loopCueMode === 'countdown' ? 'Counting' : 'Mark'}
-                onPress={() => undefined}
-                disabled
+                disabled={!canSplit}
+                label="Split"
+                onPress={recordSplit}
                 variant="secondary"
               />
-            ) : (
-              <ControlButton label="Start" onPress={startSet} disabled={!canStart} variant="primary" />
-            )}
-            <ControlButton
-              label="Split"
-              onPress={recordSplit}
-              disabled={!canSplit}
-              variant="secondary"
-            />
-            <ControlButton
-              label="Reset"
-              onPress={resetSet}
-              disabled={!isStarted && status === 'idle'}
-              variant="danger"
-            />
-          </View>
-
-          {__DEV__ && (
-            <View style={styles.debugControlRow}>
               <ControlButton
-                label="Test start beep"
-                onPress={() => {
-                  void (async () => {
-                    if (!audioReady) {
-                      await prepareCueAudio();
-                    }
+                disabled={!isStarted && status === 'idle'}
+                label="Reset"
+                onPress={resetSet}
+                variant="danger"
+              />
+            </View>
 
-                    await primeStartCueAfterInteraction().catch(() => undefined);
-                    await playStartCue({
+            {__DEV__ && (
+              <View style={styles.debugControlRow}>
+                <ControlButton
+                  label="Test start beep"
+                  onPress={() => {
+                    void prepareCueAudio();
+                    void playStartCue({
                       cueKey: 'debug-test-start',
                       repIndex: snapshot.currentRepIndex,
                       runSequence: runSequenceRef.current,
                     });
-                  })().catch(() => undefined);
-                }}
-                disabled={audioPreparing}
-                variant="secondary"
-              />
-            </View>
-          )}
-
-          {splits.length > 0 && (
-            <View style={styles.section}>
-              <Text style={styles.sectionTitle}>Splits</Text>
-              <View style={styles.splitList}>
-                {splits.map((split) => (
-                  <View key={split.id} style={styles.splitRow}>
-                    <View>
-                      <Text style={styles.splitLabel}>Split {split.id}</Text>
-                      <Text style={styles.splitMeta}>
-                        Rep {split.repNumber}
-                      </Text>
-                    </View>
-                    <Text style={styles.splitTime}>{formatPreciseClock(split.repElapsedMs)}</Text>
-                  </View>
-                ))}
-              </View>
-            </View>
-          )}
-
-          <View style={styles.section}>
-            <Text style={styles.sectionTitle}>Loop start cue</Text>
-            <View style={styles.segmentedControl}>
-              <ModeButton
-                disabled={controlsLocked}
-                label="Countdown"
-                onPress={() => updateLoopCueMode('countdown')}
-                selected={loopCueMode === 'countdown'}
-              />
-              <ModeButton
-                disabled={controlsLocked}
-                label="Take marks"
-                onPress={() => updateLoopCueMode('mark')}
-                selected={loopCueMode === 'mark'}
-              />
-            </View>
-          </View>
-
-          <View style={styles.section}>
-            <Text style={styles.sectionTitle}>Set</Text>
-            <View style={styles.toggleRow}>
-              <View style={styles.toggleCopy}>
-                <Text style={styles.toggleTitle}>Reminder</Text>
-                <Text style={styles.toggleValue}>
-                  {reminderEnabled ? `Every ${reminderSeconds || DEFAULT_SETTINGS.reminderSeconds}s` : 'Off'}
-                </Text>
-              </View>
-              <Switch
-                disabled={controlsLocked}
-                onValueChange={updateReminderEnabled}
-                thumbColor={reminderEnabled ? '#f7fff9' : '#6f817b'}
-                trackColor={{ false: '#22302c', true: '#31d67b' }}
-                value={reminderEnabled}
-              />
-            </View>
-            <View style={styles.settingsGrid}>
-              <SettingInput
-                editable={!controlsLocked}
-                label="Interval"
-                onChangeText={updateInput(setIntervalSeconds)}
-                unit="sec"
-                value={intervalSeconds}
-              />
-              <SettingInput
-                editable={!controlsLocked}
-                label="Reps"
-                onChangeText={updateInput(setReps)}
-                unit="reps"
-                value={reps}
-              />
-              <SettingInput
-                editable={!controlsLocked && reminderEnabled}
-                label="Reminder"
-                onChangeText={updateInput(setReminderSeconds)}
-                unit="sec"
-                value={reminderSeconds}
-              />
-              <SettingInput
-                editable={!controlsLocked}
-                label="Countdown"
-                onChangeText={updateInput(setCountdownSeconds)}
-                unit="sec"
-                value={countdownSeconds}
-              />
-            </View>
-
-            <Text style={styles.subsectionTitle}>Audio timing</Text>
-            <View style={styles.settingsGrid}>
-              <SettingInput
-                editable={!controlsLocked}
-                helper="Increase if Bluetooth speaker sounds late."
-                label="Audio offset"
-                onChangeText={updateInput(setAudioLeadMs)}
-                unit="ms"
-                value={audioLeadMs}
-              />
-              <SettingInput
-                editable={!controlsLocked}
-                helper="Increase if Take your marks overlaps with the start beep."
-                label="Take marks lead"
-                onChangeText={updateInput(setMarkHeardLeadMs)}
-                unit="ms"
-                value={markHeardLeadMs}
-              />
-            </View>
-
-            {parsed.errors.length > 0 && (
-              <View style={styles.errorBox}>
-                {parsed.errors.map((error) => (
-                  <Text key={error} style={styles.errorText}>
-                    {error}
-                  </Text>
-                ))}
+                  }}
+                  variant="secondary"
+                />
               </View>
             )}
-          </View>
+
+            {splits.length > 0 && (
+              <View style={styles.section}>
+                <Text style={styles.sectionTitle}>Splits</Text>
+                <View style={styles.splitList}>
+                  {splits.map((split) => (
+                    <View key={split.id} style={styles.splitRow}>
+                      <View>
+                        <Text style={styles.splitLabel}>Split {split.id}</Text>
+                        <Text style={styles.splitMeta}>Rep {split.repNumber}</Text>
+                      </View>
+                      <Text style={styles.splitTime}>{formatPreciseClock(split.repElapsedMs)}</Text>
+                    </View>
+                  ))}
+                </View>
+              </View>
+            )}
+
+            <View style={styles.section}>
+              <Text style={styles.sectionTitle}>Loop start cue</Text>
+              <View style={styles.segmentedControl}>
+                <ModeButton
+                  disabled={controlsLocked}
+                  label="Countdown"
+                  onPress={() => updateLoopCueMode('countdown')}
+                  selected={loopCueMode === 'countdown'}
+                />
+                <ModeButton
+                  disabled={controlsLocked}
+                  label="Take marks"
+                  onPress={() => updateLoopCueMode('mark')}
+                  selected={loopCueMode === 'mark'}
+                />
+              </View>
+            </View>
+
+            <View style={styles.section}>
+              <Text style={styles.sectionTitle}>Set</Text>
+              <View style={styles.toggleRow}>
+                <View style={styles.toggleCopy}>
+                  <Text style={styles.toggleTitle}>Reminder</Text>
+                  <Text style={styles.toggleValue}>
+                    {reminderEnabled
+                      ? `Every ${reminderSeconds || DEFAULT_SETTINGS.reminderSeconds}s`
+                      : 'Off'}
+                  </Text>
+                </View>
+                <Switch
+                  disabled={controlsLocked}
+                  onValueChange={updateReminderEnabled}
+                  thumbColor={reminderEnabled ? '#f7fff9' : '#6f817b'}
+                  trackColor={{ false: '#22302c', true: '#31d67b' }}
+                  value={reminderEnabled}
+                />
+              </View>
+              <View style={styles.settingsGrid}>
+                <SettingInput
+                  editable={!controlsLocked}
+                  label="Interval"
+                  onChangeText={updateInput(setIntervalSeconds)}
+                  unit="sec"
+                  value={intervalSeconds}
+                />
+                <SettingInput
+                  editable={!controlsLocked}
+                  label="Reps"
+                  onChangeText={updateInput(setReps)}
+                  unit="reps"
+                  value={reps}
+                />
+                <SettingInput
+                  editable={!controlsLocked && reminderEnabled}
+                  label="Reminder"
+                  onChangeText={updateInput(setReminderSeconds)}
+                  unit="sec"
+                  value={reminderSeconds}
+                />
+                <SettingInput
+                  editable={!controlsLocked}
+                  label="Countdown"
+                  onChangeText={updateInput(setCountdownSeconds)}
+                  unit="sec"
+                  value={countdownSeconds}
+                />
+              </View>
+
+              <Text style={styles.subsectionTitle}>Audio timing</Text>
+              <View style={styles.settingsGrid}>
+                <SettingInput
+                  editable={!controlsLocked}
+                  helper="Increase if Bluetooth speaker sounds late."
+                  label="Audio offset"
+                  onChangeText={updateInput(setAudioLeadMs)}
+                  unit="ms"
+                  value={audioLeadMs}
+                />
+                <SettingInput
+                  editable={!controlsLocked}
+                  helper="Increase if Take your marks overlaps with the start beep."
+                  label="Take marks lead"
+                  onChangeText={updateInput(setMarkHeardLeadMs)}
+                  unit="ms"
+                  value={markHeardLeadMs}
+                />
+              </View>
+
+              {parsed.errors.length > 0 && (
+                <View style={styles.errorBox}>
+                  {parsed.errors.map((error) => (
+                    <Text key={error} style={styles.errorText}>
+                      {error}
+                    </Text>
+                  ))}
+                </View>
+              )}
+            </View>
           </ScrollView>
         </KeyboardAvoidingView>
       </SafeAreaView>
@@ -1441,25 +1191,107 @@ function SettingInput({
 }
 
 const styles = StyleSheet.create({
-  screen: {
-    flex: 1,
-    backgroundColor: '#07100f',
+  audioStatus: {
+    color: '#ffcc66',
+    fontSize: 11,
+    fontWeight: '800',
+    textTransform: 'uppercase',
   },
-  safeArea: {
-    flex: 1,
+  audioStatusReady: {
+    color: '#88f0b6',
   },
-  keyboardAvoider: {
-    flex: 1,
+  brand: {
+    color: '#f7fff9',
+    fontSize: 28,
+    fontWeight: '800',
   },
   content: {
+    alignSelf: 'center',
     flexGrow: 1,
     gap: 18,
-    paddingHorizontal: 18,
+    maxWidth: 680,
     paddingBottom: 120,
+    paddingHorizontal: 18,
     paddingTop: 12,
     width: '100%',
-    maxWidth: 680,
-    alignSelf: 'center',
+  },
+  controlButton: {
+    alignItems: 'center',
+    borderRadius: 8,
+    flex: 1,
+    justifyContent: 'center',
+    minHeight: 58,
+    paddingHorizontal: 16,
+  },
+  controlButtonText: {
+    color: '#07100f',
+    fontSize: 18,
+    fontWeight: '900',
+  },
+  controlRow: {
+    flexDirection: 'row',
+    gap: 12,
+  },
+  countdown: {
+    color: '#f7fff9',
+    fontSize: 86,
+    fontWeight: '900',
+    lineHeight: 96,
+    textAlign: 'center',
+  },
+  cueLabel: {
+    color: '#4fc3ff',
+    fontSize: 12,
+    fontWeight: '800',
+    textTransform: 'uppercase',
+  },
+  cuePanel: {
+    borderColor: '#28443a',
+    borderRadius: 8,
+    borderWidth: 1,
+    padding: 12,
+  },
+  cueText: {
+    color: '#f7fff9',
+    fontSize: 24,
+    fontWeight: '800',
+    marginTop: 4,
+  },
+  dangerButton: {
+    backgroundColor: '#281717',
+    borderColor: '#ff6464',
+    borderWidth: 1,
+  },
+  dangerButtonText: {
+    color: '#ff8f8f',
+    fontSize: 18,
+    fontWeight: '900',
+  },
+  debugControlRow: {
+    flexDirection: 'row',
+  },
+  disabledButton: {
+    backgroundColor: '#22302c',
+    borderColor: '#2c3c37',
+  },
+  disabledSurface: {
+    opacity: 0.45,
+  },
+  disabledText: {
+    color: '#6f817b',
+  },
+  errorBox: {
+    backgroundColor: '#271914',
+    borderColor: '#ff9e64',
+    borderRadius: 8,
+    borderWidth: 1,
+    gap: 4,
+    padding: 12,
+  },
+  errorText: {
+    color: '#ffbd8c',
+    fontSize: 14,
+    fontWeight: '700',
   },
   header: {
     alignItems: 'center',
@@ -1470,79 +1302,43 @@ const styles = StyleSheet.create({
     alignItems: 'flex-end',
     gap: 5,
   },
-  brand: {
+  input: {
     color: '#f7fff9',
+    flex: 1,
     fontSize: 28,
-    fontWeight: '800',
-  },
-  audioStatus: {
-    color: '#ffcc66',
-    fontSize: 11,
-    fontWeight: '800',
-    textTransform: 'uppercase',
-  },
-  audioStatusReady: {
-    color: '#88f0b6',
-  },
-  statusLabel: {
-    backgroundColor: '#16241f',
-    borderColor: '#28443a',
-    borderRadius: 6,
-    borderWidth: 1,
-    color: '#88f0b6',
-    fontSize: 12,
-    fontWeight: '800',
-    letterSpacing: 0,
-    overflow: 'hidden',
-    paddingHorizontal: 10,
-    paddingVertical: 6,
-  },
-  timerPanel: {
-    backgroundColor: '#0f1b18',
-    borderColor: '#243b34',
-    borderRadius: 8,
-    borderWidth: 1,
-    padding: 18,
-    gap: 16,
-  },
-  timerLabel: {
-    color: '#9fb3ad',
-    fontSize: 14,
-    fontWeight: '700',
-    textAlign: 'center',
-    textTransform: 'uppercase',
-  },
-  countdown: {
-    color: '#f7fff9',
-    fontSize: 86,
     fontWeight: '900',
-    lineHeight: 96,
-    textAlign: 'center',
+    minHeight: 44,
+    padding: 0,
   },
-  countdownUrgent: {
-    color: '#ffcc66',
+  inputHelper: {
+    color: '#9fb3ad',
+    fontSize: 11,
+    fontWeight: '600',
+    lineHeight: 15,
+    marginTop: 6,
   },
-  progressTrack: {
-    backgroundColor: '#1a2a25',
-    borderRadius: 4,
-    height: 8,
-    overflow: 'hidden',
+  inputLabel: {
+    color: '#9fb3ad',
+    fontSize: 13,
+    fontWeight: '800',
+    textTransform: 'uppercase',
   },
-  progressFill: {
-    backgroundColor: '#31d67b',
-    height: '100%',
-  },
-  repRow: {
+  inputRow: {
+    alignItems: 'flex-end',
     flexDirection: 'row',
-    gap: 10,
+    gap: 8,
+    marginTop: 4,
+  },
+  keyboardAvoider: {
+    flex: 1,
   },
   metric: {
     backgroundColor: '#15241f',
     borderRadius: 8,
     flex: 1,
+    justifyContent: 'center',
     minHeight: 76,
     padding: 10,
-    justifyContent: 'center',
   },
   metricLabel: {
     color: '#9fb3ad',
@@ -1550,160 +1346,14 @@ const styles = StyleSheet.create({
     fontWeight: '700',
     textTransform: 'uppercase',
   },
+  metricUrgent: {
+    color: '#ffcc66',
+  },
   metricValue: {
     color: '#f7fff9',
     fontSize: 20,
     fontWeight: '800',
     marginTop: 5,
-  },
-  metricUrgent: {
-    color: '#ffcc66',
-  },
-  cuePanel: {
-    borderColor: '#28443a',
-    borderRadius: 8,
-    borderWidth: 1,
-    padding: 12,
-  },
-  cueLabel: {
-    color: '#4fc3ff',
-    fontSize: 12,
-    fontWeight: '800',
-    textTransform: 'uppercase',
-  },
-  cueText: {
-    color: '#f7fff9',
-    fontSize: 24,
-    fontWeight: '800',
-    marginTop: 4,
-  },
-  nextCue: {
-    color: '#9fb3ad',
-    fontSize: 14,
-    fontWeight: '600',
-    marginTop: 4,
-  },
-  controlRow: {
-    flexDirection: 'row',
-    gap: 12,
-  },
-  debugControlRow: {
-    flexDirection: 'row',
-  },
-  controlButton: {
-    alignItems: 'center',
-    borderRadius: 8,
-    flex: 1,
-    justifyContent: 'center',
-    minHeight: 58,
-    paddingHorizontal: 16,
-  },
-  primaryButton: {
-    backgroundColor: '#31d67b',
-  },
-  secondaryButton: {
-    backgroundColor: '#4fc3ff',
-  },
-  dangerButton: {
-    backgroundColor: '#281717',
-    borderColor: '#ff6464',
-    borderWidth: 1,
-  },
-  controlButtonText: {
-    color: '#07100f',
-    fontSize: 18,
-    fontWeight: '900',
-  },
-  dangerButtonText: {
-    color: '#ff8f8f',
-    fontSize: 18,
-    fontWeight: '900',
-  },
-  disabledButton: {
-    backgroundColor: '#22302c',
-    borderColor: '#2c3c37',
-  },
-  section: {
-    gap: 10,
-  },
-  sectionTitle: {
-    color: '#f7fff9',
-    fontSize: 16,
-    fontWeight: '800',
-  },
-  subsectionTitle: {
-    color: '#9fb3ad',
-    fontSize: 13,
-    fontWeight: '800',
-    marginTop: 4,
-    textTransform: 'uppercase',
-  },
-  splitList: {
-    gap: 8,
-  },
-  splitRow: {
-    alignItems: 'center',
-    backgroundColor: '#111f1b',
-    borderColor: '#28443a',
-    borderRadius: 8,
-    borderWidth: 1,
-    flexDirection: 'row',
-    justifyContent: 'space-between',
-    minHeight: 58,
-    paddingHorizontal: 12,
-    paddingVertical: 8,
-  },
-  splitLabel: {
-    color: '#f7fff9',
-    fontSize: 15,
-    fontWeight: '800',
-  },
-  splitMeta: {
-    color: '#9fb3ad',
-    fontSize: 12,
-    fontWeight: '700',
-    marginTop: 2,
-  },
-  splitTime: {
-    color: '#88f0b6',
-    fontSize: 18,
-    fontWeight: '900',
-  },
-  toggleRow: {
-    alignItems: 'center',
-    backgroundColor: '#111f1b',
-    borderColor: '#28443a',
-    borderRadius: 8,
-    borderWidth: 1,
-    flexDirection: 'row',
-    justifyContent: 'space-between',
-    minHeight: 58,
-    paddingHorizontal: 12,
-    paddingVertical: 8,
-  },
-  toggleCopy: {
-    flex: 1,
-    paddingRight: 12,
-  },
-  toggleTitle: {
-    color: '#f7fff9',
-    fontSize: 15,
-    fontWeight: '800',
-  },
-  toggleValue: {
-    color: '#9fb3ad',
-    fontSize: 12,
-    fontWeight: '700',
-    marginTop: 2,
-  },
-  segmentedControl: {
-    backgroundColor: '#111f1b',
-    borderColor: '#28443a',
-    borderRadius: 8,
-    borderWidth: 1,
-    flexDirection: 'row',
-    gap: 6,
-    padding: 6,
   },
   modeButton: {
     alignItems: 'center',
@@ -1724,76 +1374,173 @@ const styles = StyleSheet.create({
   modeButtonTextSelected: {
     color: '#07100f',
   },
-  settingsGrid: {
+  nextCue: {
+    color: '#9fb3ad',
+    fontSize: 14,
+    fontWeight: '600',
+    marginTop: 4,
+  },
+  pressed: {
+    opacity: 0.78,
+  },
+  primaryButton: {
+    backgroundColor: '#31d67b',
+  },
+  progressFill: {
+    backgroundColor: '#31d67b',
+    height: '100%',
+  },
+  progressTrack: {
+    backgroundColor: '#1a2a25',
+    borderRadius: 4,
+    height: 8,
+    overflow: 'hidden',
+  },
+  repRow: {
     flexDirection: 'row',
-    flexWrap: 'wrap',
     gap: 10,
+  },
+  safeArea: {
+    flex: 1,
+  },
+  screen: {
+    backgroundColor: '#07100f',
+    flex: 1,
+  },
+  secondaryButton: {
+    backgroundColor: '#4fc3ff',
+  },
+  section: {
+    gap: 10,
+  },
+  sectionTitle: {
+    color: '#f7fff9',
+    fontSize: 16,
+    fontWeight: '800',
+  },
+  segmentedControl: {
+    backgroundColor: '#111f1b',
+    borderColor: '#28443a',
+    borderRadius: 8,
+    borderWidth: 1,
+    flexDirection: 'row',
+    gap: 6,
+    padding: 6,
   },
   settingBox: {
     backgroundColor: '#111f1b',
     borderColor: '#28443a',
     borderRadius: 8,
     borderWidth: 1,
-    flexGrow: 1,
     flexBasis: '47%',
+    flexGrow: 1,
     minHeight: 88,
     minWidth: 150,
     paddingHorizontal: 12,
     paddingVertical: 10,
   },
-  inputLabel: {
+  settingsGrid: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    gap: 10,
+  },
+  splitLabel: {
+    color: '#f7fff9',
+    fontSize: 15,
+    fontWeight: '800',
+  },
+  splitList: {
+    gap: 8,
+  },
+  splitMeta: {
+    color: '#9fb3ad',
+    fontSize: 12,
+    fontWeight: '700',
+    marginTop: 2,
+  },
+  splitRow: {
+    alignItems: 'center',
+    backgroundColor: '#111f1b',
+    borderColor: '#28443a',
+    borderRadius: 8,
+    borderWidth: 1,
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    minHeight: 58,
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+  },
+  splitTime: {
+    color: '#88f0b6',
+    fontSize: 18,
+    fontWeight: '900',
+  },
+  statusLabel: {
+    backgroundColor: '#16241f',
+    borderColor: '#28443a',
+    borderRadius: 6,
+    borderWidth: 1,
+    color: '#88f0b6',
+    fontSize: 12,
+    fontWeight: '800',
+    letterSpacing: 0,
+    overflow: 'hidden',
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+  },
+  subsectionTitle: {
     color: '#9fb3ad',
     fontSize: 13,
     fontWeight: '800',
+    marginTop: 4,
     textTransform: 'uppercase',
   },
-  inputRow: {
-    alignItems: 'flex-end',
-    flexDirection: 'row',
-    gap: 8,
-    marginTop: 4,
-  },
-  input: {
-    color: '#f7fff9',
-    flex: 1,
-    fontSize: 28,
-    fontWeight: '900',
-    minHeight: 44,
-    padding: 0,
-  },
-  inputHelper: {
+  timerLabel: {
     color: '#9fb3ad',
-    fontSize: 11,
-    fontWeight: '600',
-    lineHeight: 15,
-    marginTop: 6,
+    fontSize: 14,
+    fontWeight: '700',
+    textAlign: 'center',
+    textTransform: 'uppercase',
+  },
+  timerPanel: {
+    backgroundColor: '#0f1b18',
+    borderColor: '#243b34',
+    borderRadius: 8,
+    borderWidth: 1,
+    gap: 16,
+    padding: 18,
+  },
+  toggleCopy: {
+    flex: 1,
+    paddingRight: 12,
+  },
+  toggleRow: {
+    alignItems: 'center',
+    backgroundColor: '#111f1b',
+    borderColor: '#28443a',
+    borderRadius: 8,
+    borderWidth: 1,
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    minHeight: 58,
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+  },
+  toggleTitle: {
+    color: '#f7fff9',
+    fontSize: 15,
+    fontWeight: '800',
+  },
+  toggleValue: {
+    color: '#9fb3ad',
+    fontSize: 12,
+    fontWeight: '700',
+    marginTop: 2,
   },
   unit: {
     color: '#4fc3ff',
     fontSize: 14,
     fontWeight: '800',
     paddingBottom: 7,
-  },
-  errorBox: {
-    backgroundColor: '#271914',
-    borderColor: '#ff9e64',
-    borderRadius: 8,
-    borderWidth: 1,
-    gap: 4,
-    padding: 12,
-  },
-  errorText: {
-    color: '#ffbd8c',
-    fontSize: 14,
-    fontWeight: '700',
-  },
-  disabledSurface: {
-    opacity: 0.45,
-  },
-  disabledText: {
-    color: '#6f817b',
-  },
-  pressed: {
-    opacity: 0.78,
   },
 });

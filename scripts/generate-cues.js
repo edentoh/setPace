@@ -316,6 +316,16 @@ singleTone({
   waveform: 'sine',
 });
 
+singleTone({
+  filename: 'reminder_beep.wav',
+  frequency: 1550,
+  durationMs: 240,
+  gain: 1,
+  attackMs: 4,
+  decayMs: 45,
+  waveform: 'sine',
+});
+
 completeTone();
 preserveManualAsset('take_your_marks_cue.wav', spokenTakeYourMarksCue);
 

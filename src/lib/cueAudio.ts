@@ -17,8 +17,6 @@ type CueMeta = {
 type AudioState = {
   audioReady: boolean;
   preloadComplete: boolean;
-  shortCuePlayersPrimed: boolean;
-  warmupComplete: boolean;
   playersCreated: boolean;
   preparing: boolean;
   lastError: string | null;
@@ -37,22 +35,11 @@ const PLAYER_OPTIONS = {
 };
 const PLAYER_LOAD_TIMEOUT_MS = 1200;
 const PREPARE_TIMEOUT_MS = 3500;
-const START_BUFFER_WARMUP_GAP_MS = 200;
-const START_BUFFER_WARMUP_VOLUME = 1;
 const REMINDER_VOLUME = 1;
-const SHORT_CUE_WARMUP_SEQUENCE: {
-  kind: Extract<CueKind, 'countdown' | 'reminder' | 'start'>;
-  playMs: number;
-}[] = [
-  { kind: 'countdown', playMs: 120 },
-  { kind: 'reminder', playMs: 300 },
-  { kind: 'start', playMs: 500 },
-];
 
 let players: CuePlayers | null = null;
 let cueSources: CueSources | null = null;
 let preloadPromise: Promise<void> | null = null;
-let warmupPromise: Promise<void> | null = null;
 let preparePromise: Promise<boolean> | null = null;
 let activeRunSequence: number | null = null;
 let audioState: AudioState = {
@@ -61,8 +48,6 @@ let audioState: AudioState = {
   playersCreated: false,
   preparing: false,
   preloadComplete: false,
-  shortCuePlayersPrimed: false,
-  warmupComplete: false,
 };
 
 function isDevelopment() {
@@ -158,8 +143,6 @@ export function cueAudioLog(event: string, details: Record<string, unknown> = {}
     audioReady: audioState.audioReady,
     event,
     preloadComplete: audioState.preloadComplete,
-    shortCuePlayersPrimed: audioState.shortCuePlayersPrimed,
-    warmupComplete: audioState.warmupComplete,
     ...details,
   });
 }
@@ -177,8 +160,6 @@ function cueAudioWarn(event: string, error: unknown, details: Record<string, unk
     error: serializeError(error),
     event,
     preloadComplete: audioState.preloadComplete,
-    shortCuePlayersPrimed: audioState.shortCuePlayersPrimed,
-    warmupComplete: audioState.warmupComplete,
     ...details,
   });
 }
@@ -188,7 +169,7 @@ export function getCueAudioState() {
 }
 
 export function isCueAudioReady() {
-  return audioState.audioReady && audioState.preloadComplete && audioState.warmupComplete;
+  return audioState.audioReady && audioState.preloadComplete;
 }
 
 export function setCueAudioRunSequence(runSequence: number | null) {
@@ -338,8 +319,7 @@ export async function preloadCues() {
       audioReady: false,
       lastError: null,
       preparing: true,
-      shortCuePlayersPrimed: false,
-      warmupComplete: false,
+      preloadComplete: false,
     });
 
     await configureAudioSession();
@@ -354,7 +334,7 @@ export async function preloadCues() {
 
     const cuePlayers = createCuePlayers();
     const allLoaded = await waitForPlayersLoaded(cuePlayers);
-    setAudioState({ preloadComplete: true });
+    setAudioState({ audioReady: true, lastError: null, preparing: false, preloadComplete: true });
     cueAudioLog('audio preload finished', {
       allLoaded,
       completePlayer: playerState(cuePlayers.complete),
@@ -372,8 +352,7 @@ export async function preloadCues() {
       audioReady: false,
       lastError: serializeError(error).message,
       preloadComplete: false,
-      shortCuePlayersPrimed: false,
-      warmupComplete: false,
+      preparing: false,
     });
     cueAudioWarn('audio preload failed', error);
     throw error;
@@ -402,162 +381,6 @@ async function resetPlayer(player: CuePlayer) {
   }
 }
 
-async function playCuePlayerForWarmup(
-  kind: Extract<CueKind, 'countdown' | 'reminder' | 'start'>,
-  player: CuePlayer,
-  volume: number,
-  playMs: number
-) {
-  const originalMuted = player.muted;
-  const originalVolume = player.volume;
-
-  try {
-    cueAudioLog(`${kind} warmup cue started`, {
-      originalMuted,
-      originalVolume,
-      player: playerState(player),
-      playMs,
-      volume,
-    });
-    player.muted = false;
-    player.volume = volume;
-    await resetPlayer(player);
-    player.play();
-    await wait(playMs);
-    player.pause();
-    await resetPlayer(player);
-    cueAudioLog(`${kind} warmup cue finished`, {
-      originalMuted,
-      originalVolume,
-      player: playerState(player),
-    });
-  } catch (error) {
-    cueAudioWarn(`${kind} warmup cue failed`, error, {
-      originalMuted,
-      originalVolume,
-      player: playerState(player),
-    });
-    throw error;
-  } finally {
-    try {
-      player.muted = false;
-      player.volume = 1;
-    } catch (error) {
-      cueAudioWarn(`${kind} warmup cue restore failed`, error, {
-        player: playerState(player),
-      });
-    }
-  }
-}
-
-async function playShortCueWarmupSequence(volume: number, meta: CueMeta = {}) {
-  if (!isCueMetaCurrent(meta)) {
-    cueAudioLog('short cue warmup sequence skipped for stale run', {
-      ...meta,
-      activeRunSequence,
-    });
-    return false;
-  }
-
-  const cuePlayers = getPlayers();
-  cueAudioLog('short cue warmup sequence started', {
-    ...meta,
-    countdownPlayer: playerState(cuePlayers.countdown),
-    reminderPlayer: playerState(cuePlayers.reminder),
-    startPlayer: playerState(cuePlayers.start),
-    volume,
-  });
-
-  for (let index = 0; index < SHORT_CUE_WARMUP_SEQUENCE.length; index += 1) {
-    const step = SHORT_CUE_WARMUP_SEQUENCE[index];
-
-    if (!isCueMetaCurrent(meta)) {
-      cueAudioLog('short cue warmup sequence stopped for stale run', {
-        ...meta,
-        activeRunSequence,
-      });
-      return false;
-    }
-
-    await playCuePlayerForWarmup(step.kind, cuePlayers[step.kind], volume, step.playMs);
-
-    if (index < SHORT_CUE_WARMUP_SEQUENCE.length - 1) {
-      await wait(START_BUFFER_WARMUP_GAP_MS);
-    }
-  }
-
-  if (!isCueMetaCurrent(meta)) {
-    cueAudioLog('short cue warmup sequence finished stale', {
-      ...meta,
-      activeRunSequence,
-    });
-    return false;
-  }
-
-  setAudioState({ shortCuePlayersPrimed: true });
-  cueAudioLog('short cue warmup sequence finished', {
-    ...meta,
-    countdownPlayer: playerState(cuePlayers.countdown),
-    reminderPlayer: playerState(cuePlayers.reminder),
-    startPlayer: playerState(cuePlayers.start),
-  });
-  return true;
-}
-
-export async function warmupCues() {
-  if (isCueAudioReady()) {
-    return;
-  }
-
-  if (warmupPromise !== null) {
-    return warmupPromise;
-  }
-
-  warmupPromise = (async () => {
-    setAudioState({
-      audioReady: false,
-      lastError: null,
-      preparing: true,
-      shortCuePlayersPrimed: false,
-      warmupComplete: false,
-    });
-
-    await preloadCues();
-    await configureAudioSession();
-
-    const cuePlayers = getPlayers();
-    cueAudioLog('audio warmup started', {
-      countdownPlayer: playerState(cuePlayers.countdown),
-      reminderPlayer: playerState(cuePlayers.reminder),
-      startPlayer: playerState(cuePlayers.start),
-    });
-
-    setAudioState({
-      audioReady: true,
-      lastError: null,
-      preparing: false,
-      warmupComplete: true,
-    });
-    cueAudioLog('audio warmup finished');
-  })();
-
-  try {
-    await warmupPromise;
-  } catch (error) {
-    setAudioState({
-      audioReady: false,
-      lastError: serializeError(error).message,
-      preparing: false,
-      shortCuePlayersPrimed: false,
-      warmupComplete: false,
-    });
-    cueAudioWarn('audio warmup failed', error);
-    throw error;
-  } finally {
-    warmupPromise = null;
-  }
-}
-
 export async function prepareAudioBestEffort() {
   if (isCueAudioReady()) {
     return true;
@@ -570,15 +393,13 @@ export async function prepareAudioBestEffort() {
   preparePromise = (async () => {
     try {
       setAudioState({ lastError: null, preparing: true });
-      await withTimeout(warmupCues(), PREPARE_TIMEOUT_MS, 'Audio warmup timed out');
+      await withTimeout(preloadCues(), PREPARE_TIMEOUT_MS, 'Audio preload timed out');
       return isCueAudioReady();
     } catch (error) {
       setAudioState({
         audioReady: false,
         lastError: serializeError(error).message,
         preparing: false,
-        shortCuePlayersPrimed: false,
-        warmupComplete: false,
       });
       cueAudioWarn('audio prepare failed; continuing without sound', error);
       return false;
@@ -597,8 +418,6 @@ export async function prepareAudioBestEffort() {
 export function invalidateCueAudio(reason: string) {
   setAudioState({
     audioReady: false,
-    shortCuePlayersPrimed: false,
-    warmupComplete: false,
   });
   cueAudioLog('audio invalidated', { reason });
 }
@@ -668,39 +487,6 @@ export async function playReminderCue(meta: CueMeta = {}) {
 
 export async function playCompleteCue(meta: CueMeta = {}) {
   return playCuePlayer('complete', meta);
-}
-
-export async function playWarmupCueBestEffort(meta: CueMeta = {}) {
-  cueAudioLog('start buffer warmup requested', {
-    ...meta,
-    countdownPlayer: playerState(players?.countdown),
-    reminderPlayer: playerState(players?.reminder),
-    startPlayer: playerState(players?.start),
-  });
-
-  try {
-    if (!isCueMetaCurrent(meta)) {
-      cueAudioLog('start buffer warmup skipped for stale run', {
-        ...meta,
-        activeRunSequence,
-      });
-      return false;
-    }
-
-    if (!isCueAudioReady()) {
-      void prepareAudioBestEffort();
-    }
-
-    return await playShortCueWarmupSequence(START_BUFFER_WARMUP_VOLUME, meta);
-  } catch (error) {
-    cueAudioWarn('start buffer warmup failed', error, {
-      ...meta,
-      countdownPlayer: playerState(players?.countdown),
-      reminderPlayer: playerState(players?.reminder),
-      startPlayer: playerState(players?.start),
-    });
-    return false;
-  }
 }
 
 export function stopAllCues() {

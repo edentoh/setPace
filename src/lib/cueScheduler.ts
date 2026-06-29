@@ -7,7 +7,6 @@ export type TimerSettings = {
   reminderSeconds: number;
   countdownSeconds: number;
   audioLeadMs: number;
-  startBufferMs: number;
   markHeardLeadMs: number;
   loopCueMode: LoopCueMode;
 };
@@ -56,6 +55,8 @@ const CUE_PRIORITY: Record<CueKind, number> = {
   countdown: 3,
   reminder: 4,
 };
+
+export const SHORT_BEEP_PREROLL_MS = 180;
 
 export function getInitialLeadMs(settings: TimerSettings) {
   if (settings.loopCueMode === 'mark') {
@@ -110,7 +111,7 @@ export function createCueSchedule({
 
     events.push(
       createCueEvent({
-        fireAt: repStartAt - settings.audioLeadMs,
+        fireAt: repStartAt - settings.audioLeadMs - SHORT_BEEP_PREROLL_MS,
         kind: 'start',
         repIndex,
         text: `Start rep ${repIndex + 1}`,
@@ -134,7 +135,8 @@ export function createCueSchedule({
       for (let secondsLeft = settings.countdownSeconds; secondsLeft >= 1; secondsLeft -= 1) {
         events.push(
           createCueEvent({
-            fireAt: repStartAt - secondsLeft * 1000 - settings.audioLeadMs,
+            fireAt:
+              repStartAt - secondsLeft * 1000 - settings.audioLeadMs - SHORT_BEEP_PREROLL_MS,
             kind: 'countdown',
             repIndex,
             text: String(secondsLeft),
@@ -175,7 +177,7 @@ export function createCueSchedule({
 
         events.push(
           createCueEvent({
-            fireAt: reminderAudibleAt - settings.audioLeadMs,
+            fireAt: reminderAudibleAt - settings.audioLeadMs - SHORT_BEEP_PREROLL_MS,
             kind: 'reminder',
             repIndex,
             text: `Rep ${repIndex + 1}: ${reminderSecond}s`,

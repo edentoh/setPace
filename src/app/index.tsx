@@ -25,12 +25,12 @@ import {
   playMarkCue,
   playReminderCue,
   playStartCue,
-  playWarmupCueBestEffort,
   prepareAudioBestEffort,
   setCueAudioRunSequence,
   stopAllCues,
 } from '@/lib/cueAudio';
 import {
+  SHORT_BEEP_PREROLL_MS,
   createCueSchedule,
   getDueCueEvents,
   getInitialLeadMs,
@@ -41,7 +41,7 @@ import {
   type TimerSettings,
 } from '@/lib/cueScheduler';
 
-type TimerStatus = 'idle' | 'buffering' | 'readying' | 'running' | 'paused' | 'complete';
+type TimerStatus = 'idle' | 'readying' | 'running' | 'paused' | 'complete';
 
 type TimerSnapshot = {
   elapsedMs: number;
@@ -58,7 +58,6 @@ type SplitTime = {
   repElapsedMs: number;
 };
 
-const AUDIO_START_BUFFER_MS = 1500;
 const DEFAULT_SETTINGS: TimerSettings = {
   audioLeadMs: 300,
   countdownSeconds: 5,
@@ -68,15 +67,12 @@ const DEFAULT_SETTINGS: TimerSettings = {
   reminderEnabled: true,
   reminderSeconds: 5,
   reps: 10,
-  startBufferMs: AUDIO_START_BUFFER_MS,
 };
 
 const KEEP_AWAKE_TAG = 'setpace-running-timer';
 const MARK_AUDIO_DURATION_MS = 1000;
 const MIN_MARK_TO_START_GAP_MS = 500;
 const MIN_MARK_HEARD_LEAD_MS = MARK_AUDIO_DURATION_MS + MIN_MARK_TO_START_GAP_MS;
-const MIN_START_BUFFER_MS = 500;
-const MAX_START_BUFFER_MS = 2000;
 
 function RunningWakeLock() {
   useKeepAwake(KEEP_AWAKE_TAG);
@@ -98,7 +94,6 @@ function parseSettings(
     reminderSeconds: string;
     countdownSeconds: string;
     audioLeadMs: string;
-    startBufferMs: string;
     markHeardLeadMs: string;
   },
   loopCueMode: LoopCueMode,
@@ -109,7 +104,6 @@ function parseSettings(
   const reminderSeconds = parseWholeNumber(values.reminderSeconds);
   const countdownSeconds = parseWholeNumber(values.countdownSeconds);
   const audioLeadMs = parseWholeNumber(values.audioLeadMs);
-  const startBufferMs = parseWholeNumber(values.startBufferMs);
   const markHeardLeadMs = parseWholeNumber(values.markHeardLeadMs);
   const errors: string[] = [];
 
@@ -131,14 +125,6 @@ function parseSettings(
 
   if (!Number.isFinite(audioLeadMs) || audioLeadMs < 0 || audioLeadMs > 800) {
     errors.push('Audio offset must be between 0 and 800ms.');
-  }
-
-  if (
-    !Number.isFinite(startBufferMs) ||
-    startBufferMs < MIN_START_BUFFER_MS ||
-    startBufferMs > MAX_START_BUFFER_MS
-  ) {
-    errors.push('Start buffer must be between 500 and 2000ms.');
   }
 
   if (!Number.isFinite(markHeardLeadMs) || markHeardLeadMs < 1200 || markHeardLeadMs > 4000) {
@@ -177,7 +163,6 @@ function parseSettings(
           ? reminderSeconds
           : DEFAULT_SETTINGS.reminderSeconds,
       reps,
-      startBufferMs,
     },
   };
 }
@@ -355,7 +340,6 @@ export default function HomeScreen() {
   const [reminderSeconds, setReminderSeconds] = useState(String(DEFAULT_SETTINGS.reminderSeconds));
   const [countdownSeconds, setCountdownSeconds] = useState(String(DEFAULT_SETTINGS.countdownSeconds));
   const [audioLeadMs, setAudioLeadMs] = useState(String(DEFAULT_SETTINGS.audioLeadMs));
-  const [startBufferMs, setStartBufferMs] = useState(String(DEFAULT_SETTINGS.startBufferMs));
   const [markHeardLeadMs, setMarkHeardLeadMs] = useState(
     String(DEFAULT_SETTINGS.markHeardLeadMs)
   );
@@ -383,7 +367,6 @@ export default function HomeScreen() {
   const appStateRef = useRef(AppState.currentState);
   const runSequenceRef = useRef(0);
   const splitCounterRef = useRef(0);
-  const startBufferTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const parsed = useMemo(
     () =>
@@ -395,7 +378,6 @@ export default function HomeScreen() {
           markHeardLeadMs,
           reminderSeconds,
           reps,
-          startBufferMs,
         },
         loopCueMode,
         reminderEnabled
@@ -409,16 +391,13 @@ export default function HomeScreen() {
       reminderEnabled,
       reminderSeconds,
       reps,
-      startBufferMs,
     ]
   );
 
   const displayedSettings = activeSettings ?? parsed.settings ?? DEFAULT_SETTINGS;
-  const controlsLocked =
-    status === 'buffering' || status === 'readying' || status === 'running' || status === 'paused';
+  const controlsLocked = status === 'readying' || status === 'running' || status === 'paused';
   const canStart = !controlsLocked && parsed.settings !== null;
   const isStarted =
-    status === 'buffering' ||
     status === 'readying' ||
     status === 'running' ||
     status === 'paused' ||
@@ -427,9 +406,7 @@ export default function HomeScreen() {
   const currentRepNumber =
     status === 'idle' ? 1 : Math.min(snapshot.currentRepIndex + 1, displayedSettings.reps);
   const countdownDisplay =
-    status === 'buffering'
-      ? 'Ready'
-      : status === 'readying'
+    status === 'readying'
       ? preStartCountdownSecond === null
         ? displayedSettings.loopCueMode === 'mark'
           ? 'Mark'
@@ -441,17 +418,13 @@ export default function HomeScreen() {
           ? String(snapshot.countdownSecond)
           : formatClock(Math.ceil(snapshot.timeToNextStartMs / 1000));
   const statusText =
-    status === 'buffering'
-      ? 'GET READY'
-      : status === 'readying'
+    status === 'readying'
       ? displayedSettings.loopCueMode === 'countdown'
         ? 'COUNTDOWN'
         : 'ON MARKS'
       : status.toUpperCase();
   const upcomingCueText =
-    status === 'buffering'
-      ? `Starting cues in ${formatSeconds(displayedSettings.startBufferMs)}`
-      : status === 'readying'
+    status === 'readying'
       ? displayedSettings.loopCueMode === 'countdown'
         ? 'Start rep 1 after countdown'
         : 'Start rep 1 after Take your marks'
@@ -635,26 +608,8 @@ export default function HomeScreen() {
     }
   }, [parsed.settings, status]);
 
-  const clearStartBufferTimeout = useCallback(() => {
-    if (startBufferTimeoutRef.current !== null) {
-      clearTimeout(startBufferTimeoutRef.current);
-      startBufferTimeoutRef.current = null;
-    }
-  }, []);
-
-  useEffect(() => {
-    return () => {
-      clearStartBufferTimeout();
-    };
-  }, [clearStartBufferTimeout]);
-
   const clearIdleCueState = useCallback(() => {
-    if (
-      status === 'buffering' ||
-      status === 'readying' ||
-      status === 'running' ||
-      status === 'paused'
-    ) {
+    if (status === 'readying' || status === 'running' || status === 'paused') {
       return;
     }
 
@@ -770,56 +725,37 @@ export default function HomeScreen() {
 
     const now = Date.now();
     const runSequence = runSequenceRef.current + 1;
-    const scheduleStartSetupAt = now + settings.startBufferMs;
+    const intendedStartAt = now + getInitialLeadMs(settings);
+    const schedule = createCueSchedule({
+      runSequence,
+      settings,
+      startedAt: intendedStartAt,
+    });
 
     runSequenceRef.current = runSequence;
     setCueAudioRunSequence(runSequence);
-    clearStartBufferTimeout();
     Vibration.cancel();
     firedCueKeysRef.current.clear();
     skippedCueKeysRef.current.clear();
     completeCueFiredRef.current = false;
     activeSettingsRef.current = settings;
-    activeCueScheduleRef.current = null;
-    startedAtRef.current = null;
+    activeCueScheduleRef.current = schedule;
+    startedAtRef.current = intendedStartAt;
     pausedElapsedMsRef.current = 0;
     splitCounterRef.current = 0;
     setActiveSettings(settings);
     setSplits([]);
-    setSnapshot(buildSnapshot(0, settings, 'buffering'));
-    setPreStartCountdownSecond(null);
-    setCueText('Get ready');
-    setStatus('buffering');
+    setSnapshot(buildSnapshot(0, settings, 'readying'));
+    setPreStartCountdownSecond(
+      settings.loopCueMode === 'countdown' && settings.countdownSeconds > 0
+        ? settings.countdownSeconds
+        : null
+    );
+    setCueText('Ready');
+    setStatus('readying');
 
     void prepareCueAudio();
-    void playWarmupCueBestEffort({
-      cueKey: 'start-buffer-warmup',
-    });
-
-    startBufferTimeoutRef.current = setTimeout(() => {
-      if (runSequenceRef.current !== runSequence) {
-        return;
-      }
-
-      const intendedStartAt = scheduleStartSetupAt + getInitialLeadMs(settings);
-      const schedule = createCueSchedule({
-        runSequence,
-        settings,
-        startedAt: intendedStartAt,
-      });
-
-      startBufferTimeoutRef.current = null;
-      activeCueScheduleRef.current = schedule;
-      startedAtRef.current = intendedStartAt;
-      setPreStartCountdownSecond(
-        settings.loopCueMode === 'countdown' && settings.countdownSeconds > 0
-          ? settings.countdownSeconds
-          : null
-      );
-      setCueText('Ready');
-      setStatus('readying');
-    }, settings.startBufferMs);
-  }, [clearStartBufferTimeout, parsed.settings, prepareCueAudio]);
+  }, [parsed.settings, prepareCueAudio]);
 
   const pauseSet = useCallback(() => {
     const settings = activeSettingsRef.current;
@@ -861,7 +797,6 @@ export default function HomeScreen() {
   const resetSet = useCallback(() => {
     const nextSettings = parsed.settings ?? DEFAULT_SETTINGS;
 
-    clearStartBufferTimeout();
     runSequenceRef.current += 1;
     setCueAudioRunSequence(runSequenceRef.current);
     startedAtRef.current = null;
@@ -881,7 +816,7 @@ export default function HomeScreen() {
     setCueText('Ready');
     refreshAudioStatus();
     setStatus('idle');
-  }, [clearStartBufferTimeout, parsed.settings, refreshAudioStatus]);
+  }, [parsed.settings, refreshAudioStatus]);
 
   const updateLoopCueMode = useCallback(
     (mode: LoopCueMode) => {
@@ -939,65 +874,51 @@ export default function HomeScreen() {
       resultPrefix = label
     ) => {
       setAudioDiagnosticLastPressed(label);
-      setAudioDiagnosticResult(`Warming audio for ${displayedSettings.startBufferMs}ms...`);
+      setAudioDiagnosticResult('Preparing sound...');
       void prepareCueAudio();
-      void playWarmupCueBestEffort({
-        cueKey: `manual-${label.toLowerCase().replace(/\s+/g, '-')}-warmup`,
-      });
-
-      setTimeout(() => {
-        void playCue()
-          .then((result) => {
-            refreshAudioStatus();
-            setAudioDiagnosticResult(`${resultPrefix}: ${String(result)}`);
-          })
-          .catch((error) => {
-            refreshAudioStatus();
-            setAudioDiagnosticResult(`${resultPrefix}: failed (${String(error)})`);
-          });
-      }, displayedSettings.startBufferMs);
+      void playCue()
+        .then((result) => {
+          refreshAudioStatus();
+          setAudioDiagnosticResult(`${resultPrefix}: ${String(result)}`);
+        })
+        .catch((error) => {
+          refreshAudioStatus();
+          setAudioDiagnosticResult(`${resultPrefix}: failed (${String(error)})`);
+        });
     },
-    [displayedSettings.startBufferMs, prepareCueAudio, refreshAudioStatus]
+    [prepareCueAudio, refreshAudioStatus]
   );
 
   const playAudioDiagnosticCueTwice = useCallback(
     (label: string, playCue: () => Promise<boolean>) => {
       const results: string[] = [];
       setAudioDiagnosticLastPressed(label);
-      setAudioDiagnosticResult(`Warming audio for ${displayedSettings.startBufferMs}ms...`);
+      setAudioDiagnosticResult('Preparing sound...');
 
       const runCue = (index: number) => {
         void prepareCueAudio();
-        void playWarmupCueBestEffort({
-          cueKey: `manual-${label.toLowerCase().replace(/\s+/g, '-')}-${index + 1}-warmup`,
-        });
-
-        setTimeout(() => {
-          void playCue()
-            .then((result) => {
-              results[index] = String(result);
-              refreshAudioStatus();
-              setAudioDiagnosticResult(`${label}: ${results.filter(Boolean).join(', ')}`);
-            })
-            .catch((error) => {
-              results[index] = `failed (${String(error)})`;
-              refreshAudioStatus();
-              setAudioDiagnosticResult(`${label}: ${results.filter(Boolean).join(', ')}`);
-            });
-        }, displayedSettings.startBufferMs);
+        void playCue()
+          .then((result) => {
+            results[index] = String(result);
+            refreshAudioStatus();
+            setAudioDiagnosticResult(`${label}: ${results.filter(Boolean).join(', ')}`);
+          })
+          .catch((error) => {
+            results[index] = `failed (${String(error)})`;
+            refreshAudioStatus();
+            setAudioDiagnosticResult(`${label}: ${results.filter(Boolean).join(', ')}`);
+          });
       };
 
       runCue(0);
-      setTimeout(() => runCue(1), displayedSettings.startBufferMs + 650);
+      setTimeout(() => runCue(1), 650);
     },
-    [displayedSettings.startBufferMs, prepareCueAudio, refreshAudioStatus]
+    [prepareCueAudio, refreshAudioStatus]
   );
 
   return (
     <View style={styles.screen}>
-      {(status === 'buffering' || status === 'readying' || status === 'running') && (
-        <RunningWakeLock />
-      )}
+      {(status === 'readying' || status === 'running') && <RunningWakeLock />}
       <SafeAreaView style={styles.safeArea}>
         <KeyboardAvoidingView
           behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
@@ -1069,13 +990,6 @@ export default function HomeScreen() {
                 <ControlButton label="Pause" onPress={pauseSet} variant="secondary" />
               ) : status === 'paused' ? (
                 <ControlButton label="Resume" onPress={resumeSet} variant="primary" />
-              ) : status === 'buffering' ? (
-                <ControlButton
-                  disabled
-                  label="Get ready"
-                  onPress={() => undefined}
-                  variant="secondary"
-                />
               ) : status === 'readying' ? (
                 <ControlButton
                   disabled
@@ -1208,14 +1122,6 @@ export default function HomeScreen() {
                   unit="ms"
                   value={markHeardLeadMs}
                 />
-                <SettingInput
-                  editable={!controlsLocked}
-                  helper="Helps Android/Bluetooth play the first beep reliably."
-                  label="Start buffer"
-                  onChangeText={updateInput(setStartBufferMs)}
-                  unit="ms"
-                  value={startBufferMs}
-                />
               </View>
 
               {parsed.errors.length > 0 && (
@@ -1258,20 +1164,13 @@ export default function HomeScreen() {
                     Current audio status: {audioStatusText}
                   </Text>
                   <Text style={styles.diagnosticsStatus}>
-                    Start buffer warm-up: {displayedSettings.startBufferMs}ms
+                    Short beep pre-roll: {SHORT_BEEP_PREROLL_MS}ms
                   </Text>
                   <Text style={styles.diagnosticsStatus}>
                     audioReady: {String(audioDiagnosticDetails.audioReady)}
                   </Text>
                   <Text style={styles.diagnosticsStatus}>
                     preloadComplete: {String(audioDiagnosticDetails.preloadComplete)}
-                  </Text>
-                  <Text style={styles.diagnosticsStatus}>
-                    warmupComplete: {String(audioDiagnosticDetails.warmupComplete)}
-                  </Text>
-                  <Text style={styles.diagnosticsStatus}>
-                    shortCuePlayersPrimed:{' '}
-                    {String(audioDiagnosticDetails.shortCuePlayersPrimed)}
                   </Text>
                   <Text style={styles.diagnosticsStatus}>
                     lastError: {audioDiagnosticDetails.lastError ?? 'none'}

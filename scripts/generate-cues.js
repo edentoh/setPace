@@ -5,6 +5,9 @@ const { execFileSync } = require('child_process');
 const SAMPLE_RATE = 44100;
 const OUTPUT_DIR = path.join(__dirname, '..', 'assets', 'sounds');
 const MAX_16_BIT = 32767;
+const SHORT_BEEP_PREROLL_MS = 180;
+const PREROLL_FREQUENCY = 750;
+const PREROLL_GAIN = 0.008;
 
 function clamp(value, min = -1, max = 1) {
   return Math.max(min, Math.min(max, value));
@@ -47,6 +50,28 @@ function writeWav(filename, samples) {
 
   fs.mkdirSync(OUTPUT_DIR, { recursive: true });
   fs.writeFileSync(path.join(OUTPUT_DIR, filename), buffer);
+}
+
+function writePcm16MonoWavFile(filePath, sampleRate, dataBuffer) {
+  const buffer = Buffer.alloc(44 + dataBuffer.length);
+
+  buffer.write('RIFF', 0);
+  buffer.writeUInt32LE(36 + dataBuffer.length, 4);
+  buffer.write('WAVE', 8);
+  buffer.write('fmt ', 12);
+  buffer.writeUInt32LE(16, 16);
+  buffer.writeUInt16LE(1, 20);
+  buffer.writeUInt16LE(1, 22);
+  buffer.writeUInt32LE(sampleRate, 24);
+  buffer.writeUInt32LE(sampleRate * 2, 28);
+  buffer.writeUInt16LE(2, 32);
+  buffer.writeUInt16LE(16, 34);
+  buffer.write('data', 36);
+  buffer.writeUInt32LE(dataBuffer.length, 40);
+  dataBuffer.copy(buffer, 44);
+
+  fs.mkdirSync(path.dirname(filePath), { recursive: true });
+  fs.writeFileSync(filePath, buffer);
 }
 
 function findChunk(buffer, id) {
@@ -99,6 +124,30 @@ function readWavSamples(filePath) {
   }
 
   return { sampleRate, samples };
+}
+
+function readPcm16MonoWavData(filePath) {
+  const buffer = fs.readFileSync(filePath);
+  const fmt = findChunk(buffer, 'fmt ');
+  const data = findChunk(buffer, 'data');
+
+  if (!fmt || !data) {
+    throw new Error(`Invalid WAV file: ${filePath}`);
+  }
+
+  const audioFormat = buffer.readUInt16LE(fmt.offset);
+  const channelCount = buffer.readUInt16LE(fmt.offset + 2);
+  const sampleRate = buffer.readUInt32LE(fmt.offset + 4);
+  const bitsPerSample = buffer.readUInt16LE(fmt.offset + 14);
+
+  if (audioFormat !== 1 || channelCount !== 1 || bitsPerSample !== 16) {
+    throw new Error(`Expected PCM 16-bit mono WAV: ${filePath}`);
+  }
+
+  return {
+    dataBuffer: Buffer.from(buffer.subarray(data.offset, data.offset + data.size)),
+    sampleRate,
+  };
 }
 
 function trimSilence(samples, threshold = 0.012, paddingMs = 40) {
@@ -193,27 +242,6 @@ function processedMarksCueSamples(sourcePath) {
   return normalize(processedVoice, 0.8);
 }
 
-function singleTone({
-  filename,
-  frequency,
-  durationMs,
-  gain,
-  attackMs,
-  decayMs,
-  waveform = 'sine',
-}) {
-  const totalSamples = Math.round((durationMs / 1000) * SAMPLE_RATE);
-  const samples = new Array(totalSamples);
-
-  for (let i = 0; i < totalSamples; i += 1) {
-    const phase = 2 * Math.PI * frequency * (i / SAMPLE_RATE);
-    const raw = waveform === 'triangle' ? triangleWave(phase) : Math.sin(phase);
-    samples[i] = raw * gain * envelope(i, totalSamples, attackMs, decayMs);
-  }
-
-  writeWav(filename, samples);
-}
-
 function completeTone() {
   const first = toneSamples({ frequency: 800, durationMs: 120, gain: 0.9, attackMs: 4, decayMs: 35 });
   const silence = new Array(Math.round(0.09 * SAMPLE_RATE)).fill(0);
@@ -239,6 +267,49 @@ function toneSamples({ frequency, durationMs, gain, attackMs, decayMs, waveform 
   }
 
   return samples;
+}
+
+function quietPrerollSamples(sampleRate = SAMPLE_RATE) {
+  const totalSamples = Math.round((SHORT_BEEP_PREROLL_MS / 1000) * sampleRate);
+  const fadeSamples = Math.max(1, Math.round((8 / 1000) * sampleRate));
+  const samples = new Array(totalSamples);
+
+  for (let i = 0; i < totalSamples; i += 1) {
+    const fadeIn = Math.min(1, i / fadeSamples);
+    const fadeOut = Math.min(1, (totalSamples - i - 1) / fadeSamples);
+    const gain = PREROLL_GAIN * Math.max(0, Math.min(fadeIn, fadeOut));
+    const phase = 2 * Math.PI * PREROLL_FREQUENCY * (i / sampleRate);
+
+    samples[i] = Math.sin(phase) * gain;
+  }
+
+  return samples;
+}
+
+function quietPrerollBuffer(sampleRate) {
+  const samples = quietPrerollSamples(sampleRate);
+  const buffer = Buffer.alloc(samples.length * 2);
+
+  samples.forEach((sample, index) => {
+    buffer.writeInt16LE(Math.round(clamp(sample) * MAX_16_BIT), index * 2);
+  });
+
+  return buffer;
+}
+
+function singleToneWithPreroll(options) {
+  writeWav(options.filename, [...quietPrerollSamples(), ...toneSamples(options)]);
+}
+
+function fallbackStartSamples() {
+  return toneSamples({
+    frequency: 1800,
+    durationMs: 340,
+    gain: 0.78,
+    attackMs: 4,
+    decayMs: 55,
+    waveform: 'sine',
+  });
 }
 
 function powerShellString(value) {
@@ -295,19 +366,43 @@ function preserveManualAsset(filename, generateFallback) {
   generateFallback();
 }
 
-preserveManualAsset('start_beep.wav', () => {
-  singleTone({
-    filename: 'start_beep.wav',
-    frequency: 1800,
-    durationMs: 340,
-    gain: 0.78,
-    attackMs: 4,
-    decayMs: 55,
-    waveform: 'sine',
-  });
-});
+function ensureStartBeepOriginal() {
+  const originalPath = path.join(OUTPUT_DIR, 'start_beep_original.wav');
+  const currentPath = path.join(OUTPUT_DIR, 'start_beep.wav');
 
-singleTone({
+  if (fs.existsSync(originalPath)) {
+    console.log('Keeping existing start_beep_original.wav');
+    return originalPath;
+  }
+
+  fs.mkdirSync(OUTPUT_DIR, { recursive: true });
+
+  if (fs.existsSync(currentPath)) {
+    fs.copyFileSync(currentPath, originalPath);
+    console.log('Created start_beep_original.wav from current start_beep.wav');
+    return originalPath;
+  }
+
+  writeWav('start_beep_original.wav', fallbackStartSamples());
+  console.log('Created fallback start_beep_original.wav');
+  return originalPath;
+}
+
+function writeStartBeepWithPreroll() {
+  const originalPath = ensureStartBeepOriginal();
+  const outputPath = path.join(OUTPUT_DIR, 'start_beep.wav');
+  const { dataBuffer, sampleRate } = readPcm16MonoWavData(originalPath);
+  const prerollBuffer = quietPrerollBuffer(sampleRate);
+
+  writePcm16MonoWavFile(outputPath, sampleRate, Buffer.concat([prerollBuffer, dataBuffer]));
+  console.log(
+    `Wrote start_beep.wav with ${SHORT_BEEP_PREROLL_MS}ms pre-roll from start_beep_original.wav`
+  );
+}
+
+writeStartBeepWithPreroll();
+
+singleToneWithPreroll({
   filename: 'countdown_beep.wav',
   frequency: 1100,
   durationMs: 110,
@@ -317,7 +412,7 @@ singleTone({
   waveform: 'sine',
 });
 
-singleTone({
+singleToneWithPreroll({
   filename: 'reminder_beep.wav',
   frequency: 1550,
   durationMs: 300,

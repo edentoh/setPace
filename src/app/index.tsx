@@ -25,6 +25,7 @@ import {
   playMarkCue,
   playReminderCue,
   playStartCue,
+  playWarmupCueBestEffort,
   prepareAudioBestEffort,
   setCueAudioRunSequence,
   stopAllCues,
@@ -40,7 +41,7 @@ import {
   type TimerSettings,
 } from '@/lib/cueScheduler';
 
-type TimerStatus = 'idle' | 'readying' | 'running' | 'paused' | 'complete';
+type TimerStatus = 'idle' | 'buffering' | 'readying' | 'running' | 'paused' | 'complete';
 
 type TimerSnapshot = {
   elapsedMs: number;
@@ -57,6 +58,7 @@ type SplitTime = {
   repElapsedMs: number;
 };
 
+const AUDIO_START_BUFFER_MS = 1500;
 const DEFAULT_SETTINGS: TimerSettings = {
   audioLeadMs: 300,
   countdownSeconds: 5,
@@ -66,12 +68,15 @@ const DEFAULT_SETTINGS: TimerSettings = {
   reminderEnabled: true,
   reminderSeconds: 5,
   reps: 10,
+  startBufferMs: AUDIO_START_BUFFER_MS,
 };
 
 const KEEP_AWAKE_TAG = 'setpace-running-timer';
 const MARK_AUDIO_DURATION_MS = 1000;
 const MIN_MARK_TO_START_GAP_MS = 500;
 const MIN_MARK_HEARD_LEAD_MS = MARK_AUDIO_DURATION_MS + MIN_MARK_TO_START_GAP_MS;
+const MIN_START_BUFFER_MS = 500;
+const MAX_START_BUFFER_MS = 2000;
 
 function RunningWakeLock() {
   useKeepAwake(KEEP_AWAKE_TAG);
@@ -93,6 +98,7 @@ function parseSettings(
     reminderSeconds: string;
     countdownSeconds: string;
     audioLeadMs: string;
+    startBufferMs: string;
     markHeardLeadMs: string;
   },
   loopCueMode: LoopCueMode,
@@ -103,6 +109,7 @@ function parseSettings(
   const reminderSeconds = parseWholeNumber(values.reminderSeconds);
   const countdownSeconds = parseWholeNumber(values.countdownSeconds);
   const audioLeadMs = parseWholeNumber(values.audioLeadMs);
+  const startBufferMs = parseWholeNumber(values.startBufferMs);
   const markHeardLeadMs = parseWholeNumber(values.markHeardLeadMs);
   const errors: string[] = [];
 
@@ -124,6 +131,14 @@ function parseSettings(
 
   if (!Number.isFinite(audioLeadMs) || audioLeadMs < 0 || audioLeadMs > 800) {
     errors.push('Audio offset must be between 0 and 800ms.');
+  }
+
+  if (
+    !Number.isFinite(startBufferMs) ||
+    startBufferMs < MIN_START_BUFFER_MS ||
+    startBufferMs > MAX_START_BUFFER_MS
+  ) {
+    errors.push('Start buffer must be between 500 and 2000ms.');
   }
 
   if (!Number.isFinite(markHeardLeadMs) || markHeardLeadMs < 1200 || markHeardLeadMs > 4000) {
@@ -162,6 +177,7 @@ function parseSettings(
           ? reminderSeconds
           : DEFAULT_SETTINGS.reminderSeconds,
       reps,
+      startBufferMs,
     },
   };
 }
@@ -339,6 +355,7 @@ export default function HomeScreen() {
   const [reminderSeconds, setReminderSeconds] = useState(String(DEFAULT_SETTINGS.reminderSeconds));
   const [countdownSeconds, setCountdownSeconds] = useState(String(DEFAULT_SETTINGS.countdownSeconds));
   const [audioLeadMs, setAudioLeadMs] = useState(String(DEFAULT_SETTINGS.audioLeadMs));
+  const [startBufferMs, setStartBufferMs] = useState(String(DEFAULT_SETTINGS.startBufferMs));
   const [markHeardLeadMs, setMarkHeardLeadMs] = useState(
     String(DEFAULT_SETTINGS.markHeardLeadMs)
   );
@@ -350,6 +367,10 @@ export default function HomeScreen() {
   const [splits, setSplits] = useState<SplitTime[]>([]);
   const [preStartCountdownSecond, setPreStartCountdownSecond] = useState<number | null>(null);
   const [cueText, setCueText] = useState('Ready');
+  const [audioDiagnosticsOpen, setAudioDiagnosticsOpen] = useState(false);
+  const [audioDiagnosticLastPressed, setAudioDiagnosticLastPressed] = useState('None');
+  const [audioDiagnosticResult, setAudioDiagnosticResult] = useState('No test run');
+  const [audioDiagnosticDetails, setAudioDiagnosticDetails] = useState(() => getCueAudioState());
 
   const startedAtRef = useRef<number | null>(null);
   const pausedElapsedMsRef = useRef(0);
@@ -362,6 +383,7 @@ export default function HomeScreen() {
   const appStateRef = useRef(AppState.currentState);
   const runSequenceRef = useRef(0);
   const splitCounterRef = useRef(0);
+  const startBufferTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const parsed = useMemo(
     () =>
@@ -373,6 +395,7 @@ export default function HomeScreen() {
           markHeardLeadMs,
           reminderSeconds,
           reps,
+          startBufferMs,
         },
         loopCueMode,
         reminderEnabled
@@ -386,19 +409,27 @@ export default function HomeScreen() {
       reminderEnabled,
       reminderSeconds,
       reps,
+      startBufferMs,
     ]
   );
 
   const displayedSettings = activeSettings ?? parsed.settings ?? DEFAULT_SETTINGS;
-  const controlsLocked = status === 'readying' || status === 'running' || status === 'paused';
+  const controlsLocked =
+    status === 'buffering' || status === 'readying' || status === 'running' || status === 'paused';
   const canStart = !controlsLocked && parsed.settings !== null;
   const isStarted =
-    status === 'readying' || status === 'running' || status === 'paused' || status === 'complete';
+    status === 'buffering' ||
+    status === 'readying' ||
+    status === 'running' ||
+    status === 'paused' ||
+    status === 'complete';
   const canSplit = (status === 'running' || status === 'paused') && activeSettings !== null;
   const currentRepNumber =
     status === 'idle' ? 1 : Math.min(snapshot.currentRepIndex + 1, displayedSettings.reps);
   const countdownDisplay =
-    status === 'readying'
+    status === 'buffering'
+      ? 'Ready'
+      : status === 'readying'
       ? preStartCountdownSecond === null
         ? displayedSettings.loopCueMode === 'mark'
           ? 'Mark'
@@ -410,13 +441,17 @@ export default function HomeScreen() {
           ? String(snapshot.countdownSecond)
           : formatClock(Math.ceil(snapshot.timeToNextStartMs / 1000));
   const statusText =
-    status === 'readying'
+    status === 'buffering'
+      ? 'GET READY'
+      : status === 'readying'
       ? displayedSettings.loopCueMode === 'countdown'
         ? 'COUNTDOWN'
         : 'ON MARKS'
       : status.toUpperCase();
   const upcomingCueText =
-    status === 'readying'
+    status === 'buffering'
+      ? `Starting cues in ${formatSeconds(displayedSettings.startBufferMs)}`
+      : status === 'readying'
       ? displayedSettings.loopCueMode === 'countdown'
         ? 'Start rep 1 after countdown'
         : 'Start rep 1 after Take your marks'
@@ -432,8 +467,9 @@ export default function HomeScreen() {
 
   const refreshAudioStatus = useCallback(() => {
     const cueAudioState = getCueAudioState();
-    const ready = cueAudioState.audioReady && cueAudioState.warmupComplete;
+    const ready = isCueAudioReady();
 
+    setAudioDiagnosticDetails(cueAudioState);
     setAudioReady(ready);
     setAudioStatusText(
       ready
@@ -557,7 +593,13 @@ export default function HomeScreen() {
   }, []);
 
   useEffect(() => {
-    void prepareCueAudio();
+    const timeout = setTimeout(() => {
+      void prepareCueAudio();
+    }, 0);
+
+    return () => {
+      clearTimeout(timeout);
+    };
   }, [prepareCueAudio]);
 
   useEffect(() => {
@@ -583,12 +625,36 @@ export default function HomeScreen() {
 
   useEffect(() => {
     if (status === 'idle') {
-      setSnapshot(buildSnapshot(0, parsed.settings ?? DEFAULT_SETTINGS, 'idle'));
+      const timeout = setTimeout(() => {
+        setSnapshot(buildSnapshot(0, parsed.settings ?? DEFAULT_SETTINGS, 'idle'));
+      }, 0);
+
+      return () => {
+        clearTimeout(timeout);
+      };
     }
   }, [parsed.settings, status]);
 
+  const clearStartBufferTimeout = useCallback(() => {
+    if (startBufferTimeoutRef.current !== null) {
+      clearTimeout(startBufferTimeoutRef.current);
+      startBufferTimeoutRef.current = null;
+    }
+  }, []);
+
+  useEffect(() => {
+    return () => {
+      clearStartBufferTimeout();
+    };
+  }, [clearStartBufferTimeout]);
+
   const clearIdleCueState = useCallback(() => {
-    if (status === 'readying' || status === 'running' || status === 'paused') {
+    if (
+      status === 'buffering' ||
+      status === 'readying' ||
+      status === 'running' ||
+      status === 'paused'
+    ) {
       return;
     }
 
@@ -704,39 +770,56 @@ export default function HomeScreen() {
 
     const now = Date.now();
     const runSequence = runSequenceRef.current + 1;
-    const intendedStartAt = now + getInitialLeadMs(settings);
-    const schedule = createCueSchedule({
-      runSequence,
-      settings,
-      startedAt: intendedStartAt,
-    });
+    const scheduleStartSetupAt = now + settings.startBufferMs;
 
     runSequenceRef.current = runSequence;
     setCueAudioRunSequence(runSequence);
-    stopAllCues();
+    clearStartBufferTimeout();
     Vibration.cancel();
     firedCueKeysRef.current.clear();
     skippedCueKeysRef.current.clear();
     completeCueFiredRef.current = false;
     activeSettingsRef.current = settings;
-    activeCueScheduleRef.current = schedule;
-    startedAtRef.current = intendedStartAt;
+    activeCueScheduleRef.current = null;
+    startedAtRef.current = null;
     pausedElapsedMsRef.current = 0;
     splitCounterRef.current = 0;
     setActiveSettings(settings);
     setSplits([]);
-    setSnapshot(buildSnapshot(0, settings, 'readying'));
-    setPreStartCountdownSecond(
-      settings.loopCueMode === 'countdown' && settings.countdownSeconds > 0
-        ? settings.countdownSeconds
-        : null
-    );
-    setCueText('Ready');
-    setStatus('readying');
+    setSnapshot(buildSnapshot(0, settings, 'buffering'));
+    setPreStartCountdownSecond(null);
+    setCueText('Get ready');
+    setStatus('buffering');
 
-    processDueCueEvents(now, schedule);
     void prepareCueAudio();
-  }, [parsed.settings, prepareCueAudio, processDueCueEvents]);
+    void playWarmupCueBestEffort({
+      cueKey: 'start-buffer-warmup',
+    });
+
+    startBufferTimeoutRef.current = setTimeout(() => {
+      if (runSequenceRef.current !== runSequence) {
+        return;
+      }
+
+      const intendedStartAt = scheduleStartSetupAt + getInitialLeadMs(settings);
+      const schedule = createCueSchedule({
+        runSequence,
+        settings,
+        startedAt: intendedStartAt,
+      });
+
+      startBufferTimeoutRef.current = null;
+      activeCueScheduleRef.current = schedule;
+      startedAtRef.current = intendedStartAt;
+      setPreStartCountdownSecond(
+        settings.loopCueMode === 'countdown' && settings.countdownSeconds > 0
+          ? settings.countdownSeconds
+          : null
+      );
+      setCueText('Ready');
+      setStatus('readying');
+    }, settings.startBufferMs);
+  }, [clearStartBufferTimeout, parsed.settings, prepareCueAudio]);
 
   const pauseSet = useCallback(() => {
     const settings = activeSettingsRef.current;
@@ -778,6 +861,7 @@ export default function HomeScreen() {
   const resetSet = useCallback(() => {
     const nextSettings = parsed.settings ?? DEFAULT_SETTINGS;
 
+    clearStartBufferTimeout();
     runSequenceRef.current += 1;
     setCueAudioRunSequence(runSequenceRef.current);
     startedAtRef.current = null;
@@ -797,7 +881,7 @@ export default function HomeScreen() {
     setCueText('Ready');
     refreshAudioStatus();
     setStatus('idle');
-  }, [parsed.settings, refreshAudioStatus]);
+  }, [clearStartBufferTimeout, parsed.settings, refreshAudioStatus]);
 
   const updateLoopCueMode = useCallback(
     (mode: LoopCueMode) => {
@@ -848,9 +932,72 @@ export default function HomeScreen() {
     setCueText(`Split ${splitId}`);
   }, [getRunningElapsedMs, status]);
 
+  const playAudioDiagnosticCue = useCallback(
+    (
+      label: string,
+      playCue: () => Promise<boolean>,
+      resultPrefix = label
+    ) => {
+      setAudioDiagnosticLastPressed(label);
+      setAudioDiagnosticResult(`Warming audio for ${displayedSettings.startBufferMs}ms...`);
+      void prepareCueAudio();
+      void playWarmupCueBestEffort({
+        cueKey: `manual-${label.toLowerCase().replace(/\s+/g, '-')}-warmup`,
+      });
+
+      setTimeout(() => {
+        void playCue()
+          .then((result) => {
+            refreshAudioStatus();
+            setAudioDiagnosticResult(`${resultPrefix}: ${String(result)}`);
+          })
+          .catch((error) => {
+            refreshAudioStatus();
+            setAudioDiagnosticResult(`${resultPrefix}: failed (${String(error)})`);
+          });
+      }, displayedSettings.startBufferMs);
+    },
+    [displayedSettings.startBufferMs, prepareCueAudio, refreshAudioStatus]
+  );
+
+  const playAudioDiagnosticCueTwice = useCallback(
+    (label: string, playCue: () => Promise<boolean>) => {
+      const results: string[] = [];
+      setAudioDiagnosticLastPressed(label);
+      setAudioDiagnosticResult(`Warming audio for ${displayedSettings.startBufferMs}ms...`);
+
+      const runCue = (index: number) => {
+        void prepareCueAudio();
+        void playWarmupCueBestEffort({
+          cueKey: `manual-${label.toLowerCase().replace(/\s+/g, '-')}-${index + 1}-warmup`,
+        });
+
+        setTimeout(() => {
+          void playCue()
+            .then((result) => {
+              results[index] = String(result);
+              refreshAudioStatus();
+              setAudioDiagnosticResult(`${label}: ${results.filter(Boolean).join(', ')}`);
+            })
+            .catch((error) => {
+              results[index] = `failed (${String(error)})`;
+              refreshAudioStatus();
+              setAudioDiagnosticResult(`${label}: ${results.filter(Boolean).join(', ')}`);
+            });
+        }, displayedSettings.startBufferMs);
+      };
+
+      runCue(0);
+      setTimeout(() => runCue(1), displayedSettings.startBufferMs + 650);
+    },
+    [displayedSettings.startBufferMs, prepareCueAudio, refreshAudioStatus]
+  );
+
   return (
     <View style={styles.screen}>
-      {(status === 'readying' || status === 'running') && <RunningWakeLock />}
+      {(status === 'buffering' || status === 'readying' || status === 'running') && (
+        <RunningWakeLock />
+      )}
       <SafeAreaView style={styles.safeArea}>
         <KeyboardAvoidingView
           behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
@@ -922,6 +1069,13 @@ export default function HomeScreen() {
                 <ControlButton label="Pause" onPress={pauseSet} variant="secondary" />
               ) : status === 'paused' ? (
                 <ControlButton label="Resume" onPress={resumeSet} variant="primary" />
+              ) : status === 'buffering' ? (
+                <ControlButton
+                  disabled
+                  label="Get ready"
+                  onPress={() => undefined}
+                  variant="secondary"
+                />
               ) : status === 'readying' ? (
                 <ControlButton
                   disabled
@@ -950,23 +1104,6 @@ export default function HomeScreen() {
                 variant="danger"
               />
             </View>
-
-            {__DEV__ && (
-              <View style={styles.debugControlRow}>
-                <ControlButton
-                  label="Test start beep"
-                  onPress={() => {
-                    void prepareCueAudio();
-                    void playStartCue({
-                      cueKey: 'debug-test-start',
-                      repIndex: snapshot.currentRepIndex,
-                      runSequence: runSequenceRef.current,
-                    });
-                  }}
-                  variant="secondary"
-                />
-              </View>
-            )}
 
             {splits.length > 0 && (
               <View style={styles.section}>
@@ -1071,6 +1208,14 @@ export default function HomeScreen() {
                   unit="ms"
                   value={markHeardLeadMs}
                 />
+                <SettingInput
+                  editable={!controlsLocked}
+                  helper="Helps Android/Bluetooth play the first beep reliably."
+                  label="Start buffer"
+                  onChangeText={updateInput(setStartBufferMs)}
+                  unit="ms"
+                  value={startBufferMs}
+                />
               </View>
 
               {parsed.errors.length > 0 && (
@@ -1080,6 +1225,129 @@ export default function HomeScreen() {
                       {error}
                     </Text>
                   ))}
+                </View>
+              )}
+            </View>
+
+            <View style={styles.diagnosticsPanel}>
+              <Pressable
+                accessibilityRole="button"
+                onPress={() => setAudioDiagnosticsOpen((isOpen) => !isOpen)}
+                style={({ pressed }) => [
+                  styles.diagnosticsHeader,
+                  pressed && styles.pressed,
+                ]}>
+                <View>
+                  <Text style={styles.sectionTitle}>Audio diagnostics</Text>
+                  <Text style={styles.diagnosticsSubtitle}>For testing only</Text>
+                </View>
+                <Text style={styles.diagnosticsToggle}>
+                  {audioDiagnosticsOpen ? 'Hide' : 'Show'}
+                </Text>
+              </Pressable>
+
+              {audioDiagnosticsOpen && (
+                <View style={styles.diagnosticsBody}>
+                  <Text style={styles.diagnosticsStatus}>
+                    Last pressed: {audioDiagnosticLastPressed}
+                  </Text>
+                  <Text style={styles.diagnosticsStatus}>
+                    Play result: {audioDiagnosticResult}
+                  </Text>
+                  <Text style={styles.diagnosticsStatus}>
+                    Current audio status: {audioStatusText}
+                  </Text>
+                  <Text style={styles.diagnosticsStatus}>
+                    Start buffer warm-up: {displayedSettings.startBufferMs}ms
+                  </Text>
+                  <Text style={styles.diagnosticsStatus}>
+                    audioReady: {String(audioDiagnosticDetails.audioReady)}
+                  </Text>
+                  <Text style={styles.diagnosticsStatus}>
+                    preloadComplete: {String(audioDiagnosticDetails.preloadComplete)}
+                  </Text>
+                  <Text style={styles.diagnosticsStatus}>
+                    warmupComplete: {String(audioDiagnosticDetails.warmupComplete)}
+                  </Text>
+                  <Text style={styles.diagnosticsStatus}>
+                    shortCuePlayersPrimed:{' '}
+                    {String(audioDiagnosticDetails.shortCuePlayersPrimed)}
+                  </Text>
+                  <Text style={styles.diagnosticsStatus}>
+                    lastError: {audioDiagnosticDetails.lastError ?? 'none'}
+                  </Text>
+
+                  <View style={styles.diagnosticsButtonRow}>
+                    <ControlButton
+                      label="Test start"
+                      onPress={() =>
+                        playAudioDiagnosticCue('Test start', () =>
+                          playStartCue({ cueKey: 'manual-start-test' })
+                        )
+                      }
+                      variant="secondary"
+                    />
+                    <ControlButton
+                      label="Test countdown"
+                      onPress={() =>
+                        playAudioDiagnosticCue('Test countdown', () =>
+                          playCountdownCue({ cueKey: 'manual-countdown-test' })
+                        )
+                      }
+                      variant="secondary"
+                    />
+                  </View>
+                  <View style={styles.diagnosticsButtonRow}>
+                    <ControlButton
+                      label="Test reminder"
+                      onPress={() =>
+                        playAudioDiagnosticCue('Test reminder', () =>
+                          playReminderCue({ cueKey: 'manual-reminder-test' })
+                        )
+                      }
+                      variant="secondary"
+                    />
+                    <ControlButton
+                      label="Test marks"
+                      onPress={() =>
+                        playAudioDiagnosticCue('Test marks', () =>
+                          playMarkCue({ cueKey: 'manual-mark-test' })
+                        )
+                      }
+                      variant="secondary"
+                    />
+                  </View>
+                  <View style={styles.diagnosticsButtonRow}>
+                    <ControlButton
+                      label="Test start x2"
+                      onPress={() =>
+                        playAudioDiagnosticCueTwice('Test start x2', () =>
+                          playStartCue({ cueKey: 'manual-start-test' })
+                        )
+                      }
+                      variant="secondary"
+                    />
+                    <ControlButton
+                      label="Test countdown x2"
+                      onPress={() =>
+                        playAudioDiagnosticCueTwice('Test countdown x2', () =>
+                          playCountdownCue({ cueKey: 'manual-countdown-test' })
+                        )
+                      }
+                      variant="secondary"
+                    />
+                  </View>
+                  <View style={styles.diagnosticsButtonRow}>
+                    <ControlButton
+                      label="Test reminder x2"
+                      onPress={() =>
+                        playAudioDiagnosticCueTwice('Test reminder x2', () =>
+                          playReminderCue({ cueKey: 'manual-reminder-test' })
+                        )
+                      }
+                      variant="secondary"
+                    />
+                  </View>
                 </View>
               )}
             </View>
@@ -1120,7 +1388,12 @@ function ControlButton({
         disabled && styles.disabledButton,
         pressed && styles.pressed,
       ]}>
-      <Text style={[textStyle, disabled && styles.disabledText]}>{label}</Text>
+      <Text
+        adjustsFontSizeToFit
+        numberOfLines={1}
+        style={[textStyle, disabled && styles.disabledText]}>
+        {label}
+      </Text>
     </Pressable>
   );
 }
@@ -1267,8 +1540,42 @@ const styles = StyleSheet.create({
     fontSize: 18,
     fontWeight: '900',
   },
-  debugControlRow: {
+  diagnosticsBody: {
+    gap: 8,
+  },
+  diagnosticsButtonRow: {
     flexDirection: 'row',
+    gap: 8,
+  },
+  diagnosticsHeader: {
+    alignItems: 'center',
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+  },
+  diagnosticsPanel: {
+    backgroundColor: '#111f1b',
+    borderColor: '#28443a',
+    borderRadius: 8,
+    borderWidth: 1,
+    gap: 10,
+    padding: 12,
+  },
+  diagnosticsStatus: {
+    color: '#dff8eb',
+    fontSize: 13,
+    fontWeight: '700',
+  },
+  diagnosticsSubtitle: {
+    color: '#9fb3ad',
+    fontSize: 12,
+    fontWeight: '700',
+    marginTop: 2,
+  },
+  diagnosticsToggle: {
+    color: '#4fc3ff',
+    fontSize: 13,
+    fontWeight: '900',
+    textTransform: 'uppercase',
   },
   disabledButton: {
     backgroundColor: '#22302c',

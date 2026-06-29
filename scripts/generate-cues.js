@@ -228,13 +228,14 @@ function completeTone() {
   writeWav('complete_beep.wav', [...first, ...silence, ...second]);
 }
 
-function toneSamples({ frequency, durationMs, gain, attackMs, decayMs }) {
+function toneSamples({ frequency, durationMs, gain, attackMs, decayMs, waveform = 'sine' }) {
   const totalSamples = Math.round((durationMs / 1000) * SAMPLE_RATE);
   const samples = new Array(totalSamples);
 
   for (let i = 0; i < totalSamples; i += 1) {
     const phase = 2 * Math.PI * frequency * (i / SAMPLE_RATE);
-    samples[i] = Math.sin(phase) * gain * envelope(i, totalSamples, attackMs, decayMs);
+    const raw = waveform === 'triangle' ? triangleWave(phase) : Math.sin(phase);
+    samples[i] = raw * gain * envelope(i, totalSamples, attackMs, decayMs);
   }
 
   return samples;
@@ -298,8 +299,8 @@ preserveManualAsset('start_beep.wav', () => {
   singleTone({
     filename: 'start_beep.wav',
     frequency: 1800,
-    durationMs: 410,
-    gain: 0.72,
+    durationMs: 340,
+    gain: 0.78,
     attackMs: 4,
     decayMs: 55,
     waveform: 'sine',
@@ -309,17 +310,17 @@ preserveManualAsset('start_beep.wav', () => {
 singleTone({
   filename: 'countdown_beep.wav',
   frequency: 1100,
-  durationMs: 100,
-  gain: 0.9,
+  durationMs: 110,
+  gain: 0.95,
   attackMs: 4,
-  decayMs: 30,
+  decayMs: 35,
   waveform: 'sine',
 });
 
 singleTone({
   filename: 'reminder_beep.wav',
   frequency: 1550,
-  durationMs: 240,
+  durationMs: 300,
   gain: 1,
   attackMs: 4,
   decayMs: 45,

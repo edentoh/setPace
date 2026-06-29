@@ -1,8 +1,8 @@
 import { Asset } from 'expo-asset';
 import { createAudioPlayer, preload, setAudioModeAsync } from 'expo-audio';
 
-type CueKind = 'start' | 'countdown' | 'mark' | 'reminder' | 'complete' | 'warmup';
-type PlayableCueKind = Exclude<CueKind, 'warmup'>;
+type CueKind = 'start' | 'countdown' | 'mark' | 'reminder' | 'complete';
+type PlayableCueKind = CueKind;
 type CuePlayer = ReturnType<typeof createAudioPlayer>;
 type CueSource = Parameters<typeof createAudioPlayer>[0];
 type CuePlayers = Record<CueKind, CuePlayer>;
@@ -17,6 +17,7 @@ type CueMeta = {
 type AudioState = {
   audioReady: boolean;
   preloadComplete: boolean;
+  shortCuePlayersPrimed: boolean;
   warmupComplete: boolean;
   playersCreated: boolean;
   preparing: boolean;
@@ -28,7 +29,6 @@ const COUNTDOWN_SOUND = require('@/assets/sounds/countdown_beep.wav');
 const MARK_SOUND = require('@/assets/sounds/take_your_marks_cue.wav');
 const REMINDER_SOUND = require('@/assets/sounds/reminder_beep.wav');
 const COMPLETE_SOUND = require('@/assets/sounds/complete_beep.wav');
-const WARMUP_SOUND = require('@/assets/sounds/silence_warmup.wav');
 
 const PLAYER_OPTIONS = {
   keepAudioSessionActive: true,
@@ -36,9 +36,18 @@ const PLAYER_OPTIONS = {
   updateInterval: 1000,
 };
 const PLAYER_LOAD_TIMEOUT_MS = 1200;
-const PREPARE_TIMEOUT_MS = 2200;
-const WARMUP_PLAY_MS = 140;
+const PREPARE_TIMEOUT_MS = 3500;
+const START_BUFFER_WARMUP_GAP_MS = 200;
+const START_BUFFER_WARMUP_VOLUME = 1;
 const REMINDER_VOLUME = 1;
+const SHORT_CUE_WARMUP_SEQUENCE: {
+  kind: Extract<CueKind, 'countdown' | 'reminder' | 'start'>;
+  playMs: number;
+}[] = [
+  { kind: 'countdown', playMs: 120 },
+  { kind: 'reminder', playMs: 300 },
+  { kind: 'start', playMs: 500 },
+];
 
 let players: CuePlayers | null = null;
 let cueSources: CueSources | null = null;
@@ -52,6 +61,7 @@ let audioState: AudioState = {
   playersCreated: false,
   preparing: false,
   preloadComplete: false,
+  shortCuePlayersPrimed: false,
   warmupComplete: false,
 };
 
@@ -148,6 +158,7 @@ export function cueAudioLog(event: string, details: Record<string, unknown> = {}
     audioReady: audioState.audioReady,
     event,
     preloadComplete: audioState.preloadComplete,
+    shortCuePlayersPrimed: audioState.shortCuePlayersPrimed,
     warmupComplete: audioState.warmupComplete,
     ...details,
   });
@@ -166,6 +177,7 @@ function cueAudioWarn(event: string, error: unknown, details: Record<string, unk
     error: serializeError(error),
     event,
     preloadComplete: audioState.preloadComplete,
+    shortCuePlayersPrimed: audioState.shortCuePlayersPrimed,
     warmupComplete: audioState.warmupComplete,
     ...details,
   });
@@ -176,7 +188,7 @@ export function getCueAudioState() {
 }
 
 export function isCueAudioReady() {
-  return audioState.audioReady && audioState.warmupComplete;
+  return audioState.audioReady && audioState.preloadComplete && audioState.warmupComplete;
 }
 
 export function setCueAudioRunSequence(runSequence: number | null) {
@@ -202,7 +214,6 @@ function getCueSources() {
       mark: MARK_SOUND,
       reminder: REMINDER_SOUND,
       start: START_SOUND,
-      warmup: WARMUP_SOUND,
     }
   );
 }
@@ -219,7 +230,6 @@ function createCuePlayers() {
     mark: createAudioPlayer(sources.mark, PLAYER_OPTIONS),
     reminder: createAudioPlayer(sources.reminder, PLAYER_OPTIONS),
     start: createAudioPlayer(sources.start, PLAYER_OPTIONS),
-    warmup: createAudioPlayer(sources.warmup, PLAYER_OPTIONS),
   };
 
   setAudioState({ playersCreated: true });
@@ -269,7 +279,6 @@ async function waitForPlayersLoaded(cuePlayers: CuePlayers, timeoutMs = PLAYER_L
     markPlayer: playerState(cuePlayers.mark),
     reminderPlayer: playerState(cuePlayers.reminder),
     startPlayer: playerState(cuePlayers.start),
-    warmupPlayer: playerState(cuePlayers.warmup),
   });
   return false;
 }
@@ -287,13 +296,12 @@ async function resolveCueSources() {
     return cueSources;
   }
 
-  const [complete, countdown, mark, reminder, start, warmup] = await Promise.all([
+  const [complete, countdown, mark, reminder, start] = await Promise.all([
     resolveBundledSound(COMPLETE_SOUND),
     resolveBundledSound(COUNTDOWN_SOUND),
     resolveBundledSound(MARK_SOUND),
     resolveBundledSound(REMINDER_SOUND),
     resolveBundledSound(START_SOUND),
-    resolveBundledSound(WARMUP_SOUND),
   ]);
 
   cueSources = {
@@ -302,7 +310,6 @@ async function resolveCueSources() {
     mark,
     reminder,
     start,
-    warmup,
   };
 
   cueAudioLog('audio assets resolved', {
@@ -311,7 +318,6 @@ async function resolveCueSources() {
     mark,
     reminder,
     start,
-    warmup,
   });
 
   return cueSources;
@@ -329,8 +335,10 @@ export async function preloadCues() {
   preloadPromise = (async () => {
     cueAudioLog('audio preload started');
     setAudioState({
+      audioReady: false,
       lastError: null,
       preparing: true,
+      shortCuePlayersPrimed: false,
       warmupComplete: false,
     });
 
@@ -342,7 +350,6 @@ export async function preloadCues() {
       preloadAsset(sources.mark),
       preloadAsset(sources.reminder),
       preloadAsset(sources.complete),
-      preloadAsset(sources.warmup),
     ]);
 
     const cuePlayers = createCuePlayers();
@@ -355,7 +362,6 @@ export async function preloadCues() {
       markPlayer: playerState(cuePlayers.mark),
       reminderPlayer: playerState(cuePlayers.reminder),
       startPlayer: playerState(cuePlayers.start),
-      warmupPlayer: playerState(cuePlayers.warmup),
     });
   })();
 
@@ -366,6 +372,7 @@ export async function preloadCues() {
       audioReady: false,
       lastError: serializeError(error).message,
       preloadComplete: false,
+      shortCuePlayersPrimed: false,
       warmupComplete: false,
     });
     cueAudioWarn('audio preload failed', error);
@@ -395,24 +402,106 @@ async function resetPlayer(player: CuePlayer) {
   }
 }
 
-async function warmupPlayer(player: CuePlayer) {
+async function playCuePlayerForWarmup(
+  kind: Extract<CueKind, 'countdown' | 'reminder' | 'start'>,
+  player: CuePlayer,
+  volume: number,
+  playMs: number
+) {
   const originalMuted = player.muted;
   const originalVolume = player.volume;
 
   try {
-    player.muted = true;
-    player.volume = 0;
+    cueAudioLog(`${kind} warmup cue started`, {
+      originalMuted,
+      originalVolume,
+      player: playerState(player),
+      playMs,
+      volume,
+    });
+    player.muted = false;
+    player.volume = volume;
     await resetPlayer(player);
     player.play();
-    cueAudioLog('silent warmup play started', { player: playerState(player) });
-    await wait(WARMUP_PLAY_MS);
+    await wait(playMs);
     player.pause();
     await resetPlayer(player);
-    cueAudioLog('silent warmup completed', { player: playerState(player) });
+    cueAudioLog(`${kind} warmup cue finished`, {
+      originalMuted,
+      originalVolume,
+      player: playerState(player),
+    });
+  } catch (error) {
+    cueAudioWarn(`${kind} warmup cue failed`, error, {
+      originalMuted,
+      originalVolume,
+      player: playerState(player),
+    });
+    throw error;
   } finally {
-    player.muted = originalMuted;
-    player.volume = originalVolume;
+    try {
+      player.muted = false;
+      player.volume = 1;
+    } catch (error) {
+      cueAudioWarn(`${kind} warmup cue restore failed`, error, {
+        player: playerState(player),
+      });
+    }
   }
+}
+
+async function playShortCueWarmupSequence(volume: number, meta: CueMeta = {}) {
+  if (!isCueMetaCurrent(meta)) {
+    cueAudioLog('short cue warmup sequence skipped for stale run', {
+      ...meta,
+      activeRunSequence,
+    });
+    return false;
+  }
+
+  const cuePlayers = getPlayers();
+  cueAudioLog('short cue warmup sequence started', {
+    ...meta,
+    countdownPlayer: playerState(cuePlayers.countdown),
+    reminderPlayer: playerState(cuePlayers.reminder),
+    startPlayer: playerState(cuePlayers.start),
+    volume,
+  });
+
+  for (let index = 0; index < SHORT_CUE_WARMUP_SEQUENCE.length; index += 1) {
+    const step = SHORT_CUE_WARMUP_SEQUENCE[index];
+
+    if (!isCueMetaCurrent(meta)) {
+      cueAudioLog('short cue warmup sequence stopped for stale run', {
+        ...meta,
+        activeRunSequence,
+      });
+      return false;
+    }
+
+    await playCuePlayerForWarmup(step.kind, cuePlayers[step.kind], volume, step.playMs);
+
+    if (index < SHORT_CUE_WARMUP_SEQUENCE.length - 1) {
+      await wait(START_BUFFER_WARMUP_GAP_MS);
+    }
+  }
+
+  if (!isCueMetaCurrent(meta)) {
+    cueAudioLog('short cue warmup sequence finished stale', {
+      ...meta,
+      activeRunSequence,
+    });
+    return false;
+  }
+
+  setAudioState({ shortCuePlayersPrimed: true });
+  cueAudioLog('short cue warmup sequence finished', {
+    ...meta,
+    countdownPlayer: playerState(cuePlayers.countdown),
+    reminderPlayer: playerState(cuePlayers.reminder),
+    startPlayer: playerState(cuePlayers.start),
+  });
+  return true;
 }
 
 export async function warmupCues() {
@@ -429,6 +518,7 @@ export async function warmupCues() {
       audioReady: false,
       lastError: null,
       preparing: true,
+      shortCuePlayersPrimed: false,
       warmupComplete: false,
     });
 
@@ -437,13 +527,9 @@ export async function warmupCues() {
 
     const cuePlayers = getPlayers();
     cueAudioLog('audio warmup started', {
-      warmupPlayer: playerState(cuePlayers.warmup),
-    });
-
-    await warmupPlayer(cuePlayers.warmup).catch((error) => {
-      cueAudioWarn('silent audio warmup failed; continuing', error, {
-        warmupPlayer: playerState(cuePlayers.warmup),
-      });
+      countdownPlayer: playerState(cuePlayers.countdown),
+      reminderPlayer: playerState(cuePlayers.reminder),
+      startPlayer: playerState(cuePlayers.start),
     });
 
     setAudioState({
@@ -452,13 +538,7 @@ export async function warmupCues() {
       preparing: false,
       warmupComplete: true,
     });
-    cueAudioLog('audio warmup finished', {
-      completePlayer: playerState(cuePlayers.complete),
-      countdownPlayer: playerState(cuePlayers.countdown),
-      markPlayer: playerState(cuePlayers.mark),
-      reminderPlayer: playerState(cuePlayers.reminder),
-      startPlayer: playerState(cuePlayers.start),
-    });
+    cueAudioLog('audio warmup finished');
   })();
 
   try {
@@ -468,6 +548,7 @@ export async function warmupCues() {
       audioReady: false,
       lastError: serializeError(error).message,
       preparing: false,
+      shortCuePlayersPrimed: false,
       warmupComplete: false,
     });
     cueAudioWarn('audio warmup failed', error);
@@ -496,6 +577,7 @@ export async function prepareAudioBestEffort() {
         audioReady: false,
         lastError: serializeError(error).message,
         preparing: false,
+        shortCuePlayersPrimed: false,
         warmupComplete: false,
       });
       cueAudioWarn('audio prepare failed; continuing without sound', error);
@@ -515,6 +597,7 @@ export async function prepareAudioBestEffort() {
 export function invalidateCueAudio(reason: string) {
   setAudioState({
     audioReady: false,
+    shortCuePlayersPrimed: false,
     warmupComplete: false,
   });
   cueAudioLog('audio invalidated', { reason });
@@ -585,6 +668,39 @@ export async function playReminderCue(meta: CueMeta = {}) {
 
 export async function playCompleteCue(meta: CueMeta = {}) {
   return playCuePlayer('complete', meta);
+}
+
+export async function playWarmupCueBestEffort(meta: CueMeta = {}) {
+  cueAudioLog('start buffer warmup requested', {
+    ...meta,
+    countdownPlayer: playerState(players?.countdown),
+    reminderPlayer: playerState(players?.reminder),
+    startPlayer: playerState(players?.start),
+  });
+
+  try {
+    if (!isCueMetaCurrent(meta)) {
+      cueAudioLog('start buffer warmup skipped for stale run', {
+        ...meta,
+        activeRunSequence,
+      });
+      return false;
+    }
+
+    if (!isCueAudioReady()) {
+      void prepareAudioBestEffort();
+    }
+
+    return await playShortCueWarmupSequence(START_BUFFER_WARMUP_VOLUME, meta);
+  } catch (error) {
+    cueAudioWarn('start buffer warmup failed', error, {
+      ...meta,
+      countdownPlayer: playerState(players?.countdown),
+      reminderPlayer: playerState(players?.reminder),
+      startPlayer: playerState(players?.start),
+    });
+    return false;
+  }
 }
 
 export function stopAllCues() {

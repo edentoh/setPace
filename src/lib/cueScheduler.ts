@@ -7,6 +7,7 @@ export type TimerSettings = {
   reminderSeconds: number;
   countdownSeconds: number;
   audioLeadMs: number;
+  startBufferMs: number;
   markHeardLeadMs: number;
   loopCueMode: LoopCueMode;
 };
@@ -43,10 +44,10 @@ type CreateCueScheduleOptions = {
 };
 
 const CUE_GRACE_MS: Record<CueKind, number> = {
-  countdown: 300,
-  mark: 700,
-  reminder: 300,
-  start: 450,
+  countdown: 900,
+  mark: 900,
+  reminder: 900,
+  start: 1000,
 };
 
 const CUE_PRIORITY: Record<CueKind, number> = {
